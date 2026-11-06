@@ -5,16 +5,60 @@ defmodule EXLA.Client do
   See `EXLA` module docs for a general introduction.
   """
   require Logger
+
+  @doc false
   use GenServer
+
   @name __MODULE__
 
-  @enforce_keys [:ref, :platform, :name, :device_count, :devices, :default_device_id]
-  defstruct [:ref, :platform, :name, :device_count, :devices, :default_device_id]
+  @enforce_keys [:ref, :platform, :name, :device_count, :default_device_id, :automatic_transfers]
+  defstruct [:ref, :platform, :name, :device_count, :default_device_id, :automatic_transfers]
+
+  @doc """
+  Returns the name of the default client.
+  """
+  def default_name do
+    case Application.fetch_env(:exla, :default_client) do
+      {:ok, client} ->
+        client
+
+      :error ->
+        all_clients = Application.fetch_env!(:exla, :clients)
+        preferred_clients = Application.fetch_env!(:exla, :preferred_clients)
+        supported_platforms = get_supported_platforms()
+
+        client =
+          Enum.find(preferred_clients, fn client ->
+            config =
+              all_clients[client] ||
+                raise "unknown client #{inspect(client)} given as :preferred_clients. " <>
+                        "If you plan to use :cuda or :rocm, make sure the XLA_TARGET environment variable " <>
+                        "is appropriately set. Currently it is set to #{inspect(System.get_env("XLA_TARGET"))}"
+
+            platform = config[:platform] || :host
+
+            # If you install XLA with CUDA/ROCm but there are no devices,
+            # we don't want to pick them by default.
+            match?(%{^platform => devices} when devices >= 0, supported_platforms)
+          end)
+
+        unless client do
+          raise(
+            "could not find default client for EXLA. The configured EXLA clients are: #{inspect(all_clients)}"
+          )
+        end
+
+        Application.put_env(:exla, :default_client, client)
+        client
+    end
+  end
 
   @doc """
   Fetches a client with the given `name` from configuration.
   """
   def fetch!(name) when is_atom(name) do
+    # We could use the LockedCache but that is ETS based and the clients
+    # are static enough that we can keep them on `persistent_term`.
     :persistent_term.get({__MODULE__, name}, nil) ||
       (
         clients = Application.fetch_env!(:exla, :clients)
@@ -34,55 +78,64 @@ defmodule EXLA.Client do
   """
   def get_supported_platforms do
     EXLA.NIF.get_supported_platforms()
-    |> unwrap!()
-    |> Map.new(fn {k, v} ->
-      k = k |> List.to_string() |> String.downcase(:ascii) |> String.to_atom()
-      {k, v}
-    end)
   end
 
   @doc """
-  Automatically sets platform of given client based on available platforms
-  and given platform precedence.
+  Sends `data_and_typespecs` to device infeed.
 
-  *NOTE*: This sets application configuration and must run before using any
-  EXLA functionality.
+  `data_and_typespecs` is a list of values corresponding to a single
+  infeed operation. It must be a list of two element tuples where the
+  first element is a binary and the second element is a `EXLA.Typespec`.
+  """
+  def to_infeed(%EXLA.Client{ref: client}, device_id, data_and_typespecs)
+      when is_list(data_and_typespecs) do
+    {buffers, typespecs} = Enum.unzip(data_and_typespecs)
+    EXLA.NIF.transfer_to_infeed(client, device_id, buffers, typespecs)
+  end
+
+  @doc """
+  Sends buffer from device outfeed to the given process tagged by `ref`.
+  """
+  def from_outfeed(%EXLA.Client{ref: client}, device_id, typespecs, pid, ref)
+      when is_list(typespecs) do
+    EXLA.NIF.transfer_from_outfeed(client, device_id, typespecs, pid, ref)
+  end
+
+  @doc """
+  Returns the memory statistics for a client.
+
+  Returns a map with the following keys:
+    * `:allocated` - Currently allocated memory in bytes
+    * `:peak` - Peak memory usage in bytes
+    * `:per_device` - Map of device ID to allocated memory in bytes
 
   ## Examples
 
-  This is typically helpful when writing scripts which could potentially be executed
-  from multiple platforms:
+      client = EXLA.Client.fetch!(:host)
+      EXLA.Client.get_memory_statistics(client)
+      %{allocated: 0, peak: 0, per_device: %{0 => 0}}
 
-      EXLA.set_preferred_platform(:default, [:tpu, :cuda, :rocm, :host])
-
-  The above will try to set the default client platform in order from `:tpu` to`:host`,
-  halting when it finds the highest precedence supported platform. EXLA falls back to
-  `:host` when there is no platform specified for the given client, so you can omit
-  `:host` if it's last in precedence:
-
-      # Falls back to :host if :cuda is not available
-      EXLA.set_preferred_platform(:default, [:cuda])
-
-  You can set a preferred platform for multiple clients:
-
-      # :rocm client prefers :rocm platform
-      EXLA.set_preferred_platform(:rocm, [:rocm])
-
-      # :default client prefers :tpu then :cuda
-      EXLA.set_preferred_platform(:default, [:tpu, :cuda])
   """
-  def set_preferred_platform(client_name, order) do
-    supported_platforms = get_supported_platforms()
+  def get_memory_statistics(%__MODULE__{ref: ref}) do
+    %{
+      allocated: EXLA.NIF.get_allocated_memory(ref),
+      peak: EXLA.NIF.get_peak_memory(ref),
+      per_device: EXLA.NIF.get_per_device_memory(ref)
+    }
+  end
 
-    order
-    |> Enum.reduce_while(:ok, fn platform, :ok ->
-      if Map.has_key?(supported_platforms, platform) do
-        Application.put_env(:exla, :clients, [{client_name, [platform: platform]}])
-        {:halt, :ok}
-      else
-        {:cont, :ok}
-      end
-    end)
+  @doc """
+  Resets the peak memory counter for a client.
+
+  ## Examples
+
+      iex> client = EXLA.Client.fetch!(:host)
+      iex> EXLA.Client.reset_peak_memory(client)
+      :ok
+
+  """
+  def reset_peak_memory(%__MODULE__{ref: ref}) do
+    EXLA.NIF.reset_peak_memory(ref)
   end
 
   ## Callbacks
@@ -92,26 +145,23 @@ defmodule EXLA.Client do
     GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
   end
 
-  @doc false
+  @impl true
   def init(:ok) do
     {:ok, :unused_state}
   end
 
-  @doc false
+  @impl true
   def handle_call({:client, name, options}, _from, state) do
     client = :persistent_term.get({__MODULE__, name}, nil) || build_client(name, options)
     :persistent_term.put({__MODULE__, name}, client)
     {:reply, client, state}
   end
 
-  defp build_client(name, options) do
+  @doc false
+  def build_client(name, options) do
     platform = Keyword.get(options, :platform)
-    default_device_id = Keyword.get(options, :default_device_id, 0)
     memory_fraction = Keyword.get(options, :memory_fraction, 0.9)
-
     preallocate = Keyword.get(options, :preallocate, true)
-    preallocate_int = if preallocate, do: 1, else: 0
-
     platforms = Map.keys(EXLA.Client.get_supported_platforms())
 
     ref =
@@ -128,36 +178,59 @@ defmodule EXLA.Client do
           EXLA.NIF.get_host_client()
 
         :cuda ->
-          EXLA.NIF.get_gpu_client(memory_fraction, preallocate_int)
+          EXLA.NIF.get_gpu_client(memory_fraction, preallocate)
 
         :rocm ->
-          EXLA.NIF.get_gpu_client(memory_fraction, preallocate_int)
+          EXLA.NIF.get_gpu_client(memory_fraction, preallocate)
 
         :tpu ->
           EXLA.NIF.get_tpu_client()
 
-        _ ->
-          raise ArgumentError, "unknown EXLA platform: #{inspect(platform)}"
-      end
-      |> unwrap!()
+        :pjrt_plugin ->
+          device_type =
+            case Keyword.get(options, :device_type) do
+              nil ->
+                raise ArgumentError,
+                      "the :pjrt_plugin platform requires a :device_type, the PJRT plugin device " <>
+                        "type to register and look up (for example \"tt\")"
 
-    device_count = EXLA.NIF.get_device_count(ref) |> unwrap!()
-    devices = EXLA.NIF.get_devices(ref) |> unwrap!()
+              device_type ->
+                to_string(device_type)
+            end
+
+          plugin_path =
+            Keyword.get(options, :plugin_path) ||
+              raise ArgumentError,
+                    "the :pjrt_plugin platform requires a :plugin_path pointing at the PJRT plugin " <>
+                      "shared library (for example the tt-xla pjrt_plugin_tt.so)"
+
+          :ok = EXLA.NIF.load_pjrt_plugin(device_type, plugin_path)
+          EXLA.NIF.get_c_api_client(device_type)
+
+        _ ->
+          raise ArgumentError,
+                "unknown EXLA platform #{inspect(platform)} for client #{inspect(name)}, " <>
+                  "supported platforms: #{inspect(platforms)}"
+      end
+
+    device_count = EXLA.NIF.get_device_count(ref)
+    default_device_id = Keyword.get(options, :default_device_id, 0)
 
     if default_device_id not in 0..(device_count - 1) do
-      raise ArgumentError, ":default_device_id must be a number between 0 and #{device_count - 1}"
+      raise ArgumentError,
+            ":default_device_id #{default_device_id} is outside 0..#{device_count - 1} " <>
+              "for client #{inspect(name)} on #{inspect(platform || :host)}"
     end
+
+    automatic_transfers = Keyword.get(options, :automatic_transfers, platform == :host)
 
     %EXLA.Client{
       ref: ref,
       platform: platform,
       name: name,
       device_count: device_count,
-      devices: devices,
-      default_device_id: default_device_id
+      default_device_id: default_device_id,
+      automatic_transfers: automatic_transfers
     }
   end
-
-  defp unwrap!({:ok, ref}), do: ref
-  defp unwrap!({:error, error}), do: raise(List.to_string(error))
 end

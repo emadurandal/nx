@@ -1,6 +1,13 @@
 defmodule Nx.Defn.KernelTest do
   use ExUnit.Case, async: true
 
+  require Nx.Defn.Kernel
+  alias Nx.Tensor, as: T
+  alias Nx.Defn.Expr
+
+  defp zero(), do: Nx.tensor(0, type: {:u, 8})
+  defp one(), do: Nx.tensor(1, type: {:u, 8})
+
   describe "doctests" do
     use Nx.Defn.Kernel
     doctest Nx.Defn.Kernel
@@ -19,42 +26,55 @@ defmodule Nx.Defn.KernelTest do
       assert Nx.Defn.Kernel.*(1, 2) == 2
     end
 
+    test "**" do
+      assert Nx.Defn.Kernel.**(1, 2) == 1
+    end
+
     test "/" do
       assert Nx.Defn.Kernel./(1, 2) == 0.5
     end
 
-    test "and" do
-      assert Nx.Defn.Kernel.and(0, 0) == 0
-      assert Nx.Defn.Kernel.and(1, 0) == 0
-      assert Nx.Defn.Kernel.and(0, 2) == 0
-      assert Nx.Defn.Kernel.and(1, 1) == 1
+    test "comparison" do
+      assert Nx.Defn.Kernel.==(0, 0) == one()
+      assert Nx.Defn.Kernel.!=(0, 0) == zero()
+      assert Nx.Defn.Kernel.>(0, 0) == zero()
+      assert Nx.Defn.Kernel.>=(0, 0) == one()
+      assert Nx.Defn.Kernel.<(0, 0) == zero()
+      assert Nx.Defn.Kernel.<=(0, 0) == one()
+    end
 
-      assert Nx.Defn.Kernel.and(0, 0.0) == 0.0
-      assert Nx.Defn.Kernel.and(1, 0.0) == 0.0
-      assert Nx.Defn.Kernel.and(0, 2.0) == 0.0
-      assert Nx.Defn.Kernel.and(1, 1.0) == 1.0
+    test "and" do
+      assert Nx.Defn.Kernel.and(0, 0) == zero()
+      assert Nx.Defn.Kernel.and(1, 0) == zero()
+      assert Nx.Defn.Kernel.and(0, 2) == zero()
+      assert Nx.Defn.Kernel.and(1, 1) == one()
+
+      assert Nx.Defn.Kernel.and(0, 0.0) == zero()
+      assert Nx.Defn.Kernel.and(1, 0.0) == zero()
+      assert Nx.Defn.Kernel.and(0, 2.0) == zero()
+      assert Nx.Defn.Kernel.and(1, 1.0) == one()
     end
 
     test "or" do
-      assert Nx.Defn.Kernel.or(0, 0) == 0
-      assert Nx.Defn.Kernel.or(1, 0) == 1
-      assert Nx.Defn.Kernel.or(0, 2) == 1
-      assert Nx.Defn.Kernel.or(1, 1) == 1
+      assert Nx.Defn.Kernel.or(0, 0) == zero()
+      assert Nx.Defn.Kernel.or(1, 0) == one()
+      assert Nx.Defn.Kernel.or(0, 2) == one()
+      assert Nx.Defn.Kernel.or(1, 1) == one()
 
-      assert Nx.Defn.Kernel.or(0, 0.0) == 0.0
-      assert Nx.Defn.Kernel.or(1, 0.0) == 1.0
-      assert Nx.Defn.Kernel.or(0, 2.0) == 1.0
-      assert Nx.Defn.Kernel.or(1, 1.0) == 1.0
+      assert Nx.Defn.Kernel.or(0, 0.0) == zero()
+      assert Nx.Defn.Kernel.or(1, 0.0) == one()
+      assert Nx.Defn.Kernel.or(0, 2.0) == one()
+      assert Nx.Defn.Kernel.or(1, 1.0) == one()
     end
 
     test "not" do
-      assert Nx.Defn.Kernel.not(0) == 1
-      assert Nx.Defn.Kernel.not(1) == 0
-      assert Nx.Defn.Kernel.not(2) == 0
+      assert Nx.Defn.Kernel.not(0) == one()
+      assert Nx.Defn.Kernel.not(1) == zero()
+      assert Nx.Defn.Kernel.not(2) == zero()
 
-      assert Nx.Defn.Kernel.not(0.0) == 1.0
-      assert Nx.Defn.Kernel.not(1.0) == 0.0
-      assert Nx.Defn.Kernel.not(2.0) == 0.0
+      assert Nx.Defn.Kernel.not(0.0) == one()
+      assert Nx.Defn.Kernel.not(1.0) == zero()
+      assert Nx.Defn.Kernel.not(2.0) == zero()
     end
 
     test "&&&" do
@@ -78,13 +98,13 @@ defmodule Nx.Defn.KernelTest do
       assert Nx.Defn.Kernel.-(1) == -1
     end
 
-    test "~~~" do
-      assert Nx.Defn.Kernel.~~~(1) == -2
-    end
-
     test "min/max" do
       assert Nx.Defn.Kernel.min(0, 1) == 0
       assert Nx.Defn.Kernel.max(0, 1) == 1
+    end
+
+    test "div" do
+      assert Nx.Defn.Kernel.div(11, 5) == 2
     end
 
     test "rem" do
@@ -99,16 +119,80 @@ defmodule Nx.Defn.KernelTest do
   describe "inside defn" do
     import Nx.Defn
 
-    defn assert_square_matrix(tensor) do
-      assert_shape_pattern(tensor, {x, x})
+    defn tap_and_then(a, b, c) do
+      a
+      |> Nx.add(b)
+      |> tap(&send_up/1)
+      |> then(&Nx.subtract(c, &1))
     end
 
-    test "assert_shape_pattern" do
-      assert_square_matrix(Nx.tensor([[1, 2], [3, 4]]))
+    defp send_up(expr) do
+      send(self(), {:expr, expr})
+    end
 
-      assert_raise ArgumentError,
-                   "expected tensor to match shape {x, x}, got tensor with shape {1, 2}",
-                   fn -> assert_square_matrix(Nx.tensor([[1, 2]])) end
+    test "tap and then" do
+      assert tap_and_then(1, 2, 3) == Nx.tensor(0)
+      assert_received {:expr, %Nx.Tensor{data: %Nx.Defn.Expr{}}}
+    end
+
+    import Nx.Defn.Kernel, only: [keyword!: 2]
+    defn defn_after_import(tensor), do: -tensor
+
+    test "defn after import works" do
+      assert defn_after_import(1) == Nx.tensor(-1)
+    end
+  end
+
+  describe "io_calls" do
+    defp zero_expr(), do: Nx.tensor(0, type: {:u, 8}, backend: Nx.Defn.Expr)
+
+    test "io_call/2,3" do
+      result = Nx.Defn.Kernel.io_call(zero_expr(), :a)
+      assert %T{data: %Expr{op: :io_call}} = result
+      assert inspect(result, safe: false) =~ "io_call"
+      assert inspect(result, safe: false) =~ "a:"
+
+      result = Nx.Defn.Kernel.io_call(zero_expr(), &Function.identity/1)
+      assert %T{data: %Expr{op: :io_call}} = result
+      assert inspect(result, safe: false) =~ "io_call"
+
+      result = Nx.Defn.Kernel.io_call(zero_expr(), :a, &Function.identity/1)
+      assert %T{data: %Expr{op: :io_call}} = result
+      assert inspect(result, safe: false) =~ "a:"
+    end
+  end
+
+  describe "macros" do
+    test "defines runtime raise macros" do
+      macros = Nx.Defn.Kernel.__info__(:macros)
+      assert {:runtime_raise, 1} in macros
+      refute {:runtime_raise, 2} in macros
+      refute {:raise_if, 3} in macros
+      refute {:raise_if, 4} in macros
+    end
+
+    test "runtime_raise/1 requires a compile-time string" do
+      assert_raise ArgumentError, ~r/compile-time string/, fn ->
+        Code.eval_string("""
+        defmodule Nx.Defn.KernelTest.RuntimeRaiseNotString do
+          import Nx.Defn
+          defn go(t), do: runtime_raise(t)
+        end
+        """)
+      end
+    end
+
+    test "raise outside of defn" do
+      assert_raise RuntimeError,
+                   "cannot invoke Nx.Defn.Kernel.if/2 because you are not inside a defn",
+                   fn ->
+                     Code.eval_quoted(
+                       quote do
+                         require Nx.Defn.Kernel
+                         Nx.Defn.Kernel.if(1, do: 0)
+                       end
+                     )
+                   end
     end
   end
 end

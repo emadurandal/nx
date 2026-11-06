@@ -1,0 +1,495 @@
+defmodule Nx.LinAlg.SVD do
+  @moduledoc false
+
+  # Implementation of Singular Value Decomposition
+  # Inspired by the Jax code in https://github.com/google/jax/blob/ba557d5e1beb480851117a003ebf76c0ed2249e0/jax/_src/lax/svd.py
+  # QDWH is QR-based Dynamically Weighted Halley iteration
+  #
+  # References (same as Jax, above):
+  #
+  # * Nakatsukasa, Yuji, and Nicholas J. Higham.
+  #   "Stable and efficient spectral divide and conquer algorithms for the symmetric
+  #   eigenvalue decomposition and the SVD." SIAM Journal on Scientific Computing 35,
+  #   no. 3 (2013): A1325-A1349.
+  #   https://epubs.siam.org/doi/abs/10.1137/120876605
+  #
+  # * Nakatsukasa, Yuji, Zhaojun Bai, and François Gygi.
+  #   "Optimizing Halley's iteration for computing the matrix polar decomposition."
+  #   SIAM Journal on Matrix Analysis and Applications 31, no. 5 (2010): 2700-2720.
+  #   https://epubs.siam.org/doi/abs/10.1137/090774999
+
+  import Nx.Defn
+  @eps 1.1920929e-07
+
+  defn svd(input_tensor, opts) do
+    {target_shape, u_shape, s_shape, vt_shape} = calculate_shapes(input_tensor)
+
+    tensor = Nx.revectorize(input_tensor, [vector: :auto], target_shape: target_shape)
+
+    {u, s, vt} =
+      if Nx.all(tensor == 0) do
+        svd_all_zeros(tensor, opts)
+      else
+        svd_non_zero(tensor, opts)
+      end
+
+    # we can force [] as the vectorized axes because we are guaranteed that the input is devectorized
+    result = {
+      Nx.revectorize(u, [], target_shape: u_shape),
+      Nx.revectorize(s, [], target_shape: s_shape),
+      Nx.revectorize(vt, [], target_shape: vt_shape)
+    }
+
+    custom_grad(result, [input_tensor], fn g ->
+      svd_grad(result, input_tensor, g)
+    end)
+  end
+
+  deftransformp calculate_shapes(t) do
+    shape = Nx.shape(t)
+    rank = tuple_size(shape)
+    m = elem(shape, rank - 2)
+    n = elem(shape, rank - 1)
+
+    collapsed_axes = shape |> Tuple.delete_at(rank - 2) |> Tuple.delete_at(rank - 2)
+
+    u_shape = collapsed_axes |> Nx.Shared.tuple_append(m) |> Nx.Shared.tuple_append(:auto)
+    s_shape = Nx.Shared.tuple_append(collapsed_axes, :auto)
+    vt_shape = Nx.Shared.tuple_append(s_shape, n)
+
+    {{m, n}, u_shape, s_shape, vt_shape}
+  end
+
+  defnp svd_all_zeros(a, opts) do
+    {m, n} = Nx.shape(a)
+
+    k =
+      case {m, n} do
+        {m, n} when m > n -> n
+        _ -> m
+      end
+
+    min_shape = Kernel.min(m, n)
+    {u_cols, v_rows} = if opts[:full_matrices?], do: {m, n}, else: {min_shape, min_shape}
+
+    s = Nx.broadcast(Nx.tensor(0, type: Nx.type(a)), {k})
+
+    [s, _] = Nx.broadcast_vectors([s, a])
+
+    u = Nx.eye({m, u_cols}, vectorized_axes: a.vectorized_axes, type: Nx.type(a))
+    v = Nx.eye({v_rows, n}, vectorized_axes: a.vectorized_axes, type: Nx.type(a))
+
+    {u, s, v}
+  end
+
+  defnp svd_full(tensor, opts) do
+    {reduce_to_square, q, u_null, a} =
+      case Nx.shape(tensor) do
+        {m, n} when m > n ->
+          {q_full, a_full} = Nx.LinAlg.qr(tensor, mode: :complete)
+          q = q_full[[0..-1//1, 0..(n - 1)//1]]
+          u_null = q_full[[0..-1//1, n..-1//1]]
+          a = a_full[0..(n - 1)//1]
+          {true, q, u_null, a}
+
+        {n, n} ->
+          {false, tensor, tensor, tensor}
+      end
+
+    {u, s, v} = svd_tall_and_square(a, opts)
+
+    u =
+      if reduce_to_square do
+        u = Nx.dot(q, u)
+        Nx.concatenate([u, u_null], axis: -1)
+      else
+        u
+      end
+
+    {u, s, v}
+  end
+
+  defnp svd_non_full(tensor, opts) do
+    {_m, n} = Nx.shape(tensor)
+
+    # Gram matrix approach: G = AᵀA lives in n × n space regardless of m, avoiding
+    # large QDWH intermediates (e.g. (m+n) × (m+n) QR steps) when m ≈ n.
+    # Trade-off: forming AᵀA squares the condition number, so the smallest singular
+    # values lose ~half their float precision. Well-conditioned matrices are fine;
+    # ill-conditioned inputs that depend on small singular values should use
+    # full_matrices?: true instead.
+    # Inspired by https://github.com/ausimian/emily/pull/85 and
+    # https://elixirforum.com/t/porting-sakana-ais-trinity-qwen-based-model-to-elixir-bumblebee-nx-axon/75171/10
+
+    gram =
+      case Nx.type(tensor) do
+        {:c, _} ->
+          tensor = Nx.conjugate(tensor)
+          Nx.dot(tensor, [-2], tensor, [-2])
+
+        _ ->
+          Nx.dot(tensor, [-2], tensor, [-2])
+      end
+
+    {s_sq, v} = Nx.LinAlg.eigh(gram, max_iter: opts[:max_iter])
+
+    # clamp small floating-point negatives before sqrt
+    s = Nx.sqrt(Nx.max(s_sq, 0))
+
+    # eigh returns ascending order; sort descending
+    sort_idx = Nx.argsort(s, direction: :desc)
+    s = Nx.take(s, sort_idx)
+    v = Nx.take(v, sort_idx, axis: 1)
+
+    # U = AV · S⁻¹; zero out columns corresponding to near-zero singular values
+    s_inv = Nx.select(s > n * @eps * s[0], 1 / s, Nx.broadcast(0, Nx.shape(s)))
+    u = Nx.dot(tensor, v) * Nx.new_axis(s_inv, 0)
+
+    {u, s, v}
+  end
+
+  defnp svd_non_zero(input_tensor, opts) do
+    {is_flipped, a} =
+      case Nx.shape(input_tensor) do
+        {m, n} when m < n ->
+          {true, Nx.LinAlg.adjoint(input_tensor)}
+
+        _ ->
+          {false, input_tensor}
+      end
+
+    {u, s, v} =
+      if opts[:full_matrices?] do
+        svd_full(a, opts)
+      else
+        svd_non_full(a, opts)
+      end
+
+    if is_flipped do
+      {v, s, Nx.LinAlg.adjoint(u)}
+    else
+      {u, s, Nx.LinAlg.adjoint(v)}
+    end
+  end
+
+  defnp svd_tall_and_square(a, opts) do
+    {_m, n} = Nx.shape(a)
+    {u, h} = qdwh(a, opts)
+    # ensure H is hermitian
+    h = (h + Nx.LinAlg.adjoint(h)) / 2
+    {s, v} = Nx.LinAlg.eigh(h, max_iter: opts[:max_iter])
+
+    sign = Nx.select(s < 0, -1, 1)
+
+    v = sign * v
+    s = sign * s
+
+    # sort s and v according to
+    sort_idx = Nx.argsort(s, direction: :desc)
+
+    s_out = Nx.take(s, sort_idx)
+    v_out = Nx.take(v, sort_idx, axis: 1)
+
+    u_out = Nx.dot(u, v_out)
+
+    u_out = Nx.select(s[0] < n * @eps * s_out[0], correct_rank_deficiency(u_out), u_out)
+    {u_out, s_out, v_out}
+  end
+
+  defnp qdwh(x, opts) do
+    # reference implementation taken from Jax
+    alpha = Nx.sqrt(Nx.LinAlg.norm(x, ord: 1)) * Nx.sqrt(Nx.LinAlg.norm(x, ord: :inf))
+    l = @eps
+
+    u = x / alpha
+    tol_l = 5 * @eps
+    tol_norm = Nx.cbrt(tol_l)
+
+    one_u8 = Nx.iota({}, type: :u8, vectorized_axes: u.vectorized_axes) + 1
+    original_type = Nx.type(u)
+    u = Nx.as_type(u, min_precision_type(original_type))
+
+    {u, _l, _num_iters, _is_unconverged, _is_not_max_iteration, _max_iter} =
+      while {u, l, iter_idx = 1, is_unconverged = one_u8, is_not_max_iteration = one_u8,
+             max_iter = opts[:max_iter]},
+            is_unconverged and is_not_max_iteration do
+        u_prev = u
+
+        l2 = l ** 2
+        # if l2 is too small, dd will tend to infinity.
+        # keeping it at the `eps` noise floor helps
+        # avoid this problem.
+        l2 = Nx.select(l2 < @eps, @eps, l2)
+        dd = Nx.cbrt(4.0 * (1.0 / l2 - 1.0) / l2)
+        sqd = Nx.sqrt(1.0 + dd)
+        a = sqd + Nx.sqrt(8.0 - 4.0 * dd + 8.0 * (2.0 - l2) / (l2 * sqd)) / 2
+        a = Nx.real(a)
+        b = (a - 1.0) ** 2 / 4.0
+        c = a + b - 1.0
+
+        l = l * (a + b * l2) / (1.0 + c * l2)
+
+        u =
+          if c > 100 do
+            qdwh_use_qr(u, x, a, b, c)
+          else
+            qdwh_use_cholesky(u, x, a, b, c)
+          end
+
+        iterating_l = Nx.abs(1.0 - l) > tol_l
+        iterating_u = Nx.LinAlg.norm(u - u_prev) > tol_norm
+        is_unconverged = iterating_l or iterating_u
+        is_not_max_iteration = iter_idx < max_iter
+        {u, l, iter_idx + 1, is_unconverged, is_not_max_iteration, max_iter}
+      end
+
+    u = Nx.as_type(u, original_type)
+    u = 1.5 * u - 0.5 * Nx.dot(u, Nx.dot(Nx.LinAlg.adjoint(u), u))
+    h = u |> Nx.LinAlg.adjoint() |> Nx.dot(x)
+    h = (h + Nx.LinAlg.adjoint(h)) / 2
+    {u, h}
+  end
+
+  # f16 is not enough precision to compute SVD
+  deftransformp(min_precision_type({:f, 64}), do: {:f, 64})
+  deftransformp(min_precision_type(_), do: {:f, 32})
+
+  defnp qdwh_use_qr(u, x, a, b, c) do
+    {m, _n} = Nx.shape(x)
+    {_u_m, u_n} = Nx.shape(u)
+
+    y = Nx.concatenate([Nx.sqrt(c) * u, Nx.eye(u_n)], axis: 0)
+    {q, _r} = Nx.LinAlg.qr(y)
+    q1 = q[0..(m - 1)//1]
+    q2 = Nx.LinAlg.adjoint(q[m..-1//1])
+    e = b / c
+
+    e * u + (a - e) / Nx.sqrt(c) * Nx.dot(q1, q2)
+  end
+
+  defnp qdwh_use_cholesky(u, _x, a, b, c) do
+    {_, u_n} = Nx.shape(u)
+    uh = Nx.LinAlg.adjoint(u)
+    x = c * Nx.dot(uh, u) + Nx.eye(u_n)
+    y = Nx.LinAlg.cholesky(x)
+
+    ybar =
+      case Nx.type(y) do
+        {:c, _} -> Nx.conjugate(y)
+        _ -> y
+      end
+
+    zbar =
+      Nx.LinAlg.triangular_solve(
+        ybar,
+        Nx.transpose(u),
+        left_side: true,
+        lower: true
+      )
+
+    z =
+      case Nx.type(zbar) do
+        {:c, _} -> Nx.conjugate(zbar)
+        _ -> zbar
+      end
+
+    z =
+      y
+      |> Nx.LinAlg.adjoint()
+      |> Nx.LinAlg.triangular_solve(z, left_side: true, lower: false)
+      |> Nx.LinAlg.adjoint()
+
+    e = b / c
+
+    e * u + (a - e) * z
+  end
+
+  defnp correct_rank_deficiency(u_out) do
+    {u_out, r} = Nx.LinAlg.qr(u_out)
+
+    diagonal = Nx.take_diagonal(r)
+    diag_r = diagonal < 0
+    sign_r = Nx.select(diag_r, -1, 1)
+    sign_r = Nx.select(diagonal == 0, 0, sign_r)
+
+    # same as Nx.dot(u_out, Nx.make_diagonal(sign_r))
+    u_out * sign_r
+  end
+
+  defn svd_grad({u, s_input, vt}, input, g) do
+    [dispatch_svd_grad({u, s_input, vt}, input, g)]
+  end
+
+  # Tall / square: https://j-towns.github.io/papers/svd-derivative.pdf
+  # Wide: SVD(Aᴴ) swaps U and V, so reuse the tall VJP and adjoint da.
+  deftransformp dispatch_svd_grad({u, s_input, vt}, input, {du, ds, dvt}) do
+    rank = tuple_size(Nx.shape(input))
+    m = elem(Nx.shape(input), rank - 2)
+    n = elem(Nx.shape(input), rank - 1)
+
+    if m < n do
+      da_h =
+        svd_grad_tall(
+          {Nx.LinAlg.adjoint(vt), s_input, Nx.LinAlg.adjoint(u)},
+          Nx.LinAlg.adjoint(input),
+          {Nx.LinAlg.adjoint(dvt), ds, Nx.LinAlg.adjoint(du)}
+        )
+
+      Nx.LinAlg.adjoint(da_h)
+    else
+      svd_grad_tall({u, s_input, vt}, input, {du, ds, dvt})
+    end
+  end
+
+  defnp svd_grad_tall({u, s_input, vt}, input, {du, ds, dvt}) do
+    m = Nx.axis_size(input, -2)
+    n = Nx.axis_size(input, -1)
+    k = Nx.axis_size(s_input, -1)
+    batch_axes = batch_axes(input)
+
+    u_full = u
+    du_full = du
+
+    u =
+      if m == n do
+        u
+      else
+        slice_last_matrix(u, m, k)
+      end
+
+    du =
+      if m == n do
+        du
+      else
+        slice_last_matrix(du, m, k)
+      end
+
+    # https://j-towns.github.io/papers/svd-derivative.pdf
+
+    eye_k = eye_from_vector(s_input)
+
+    s_sq = s_input ** 2
+    sub = -(Nx.new_axis(s_sq, -1) - Nx.new_axis(s_sq, -2)) + eye_k
+    f = Nx.select(eye_k, 0, 1 / sub)
+
+    s = Nx.new_axis(s_input, -1) * eye_k
+    s_inv = Nx.new_axis(1 / s_input, -1) * eye_k
+    ds_matrix = eye_k * Nx.new_axis(ds, -2)
+
+    ut_du = Nx.dot(Nx.LinAlg.adjoint(u), [-1], batch_axes, du, [-2], batch_axes)
+
+    ut_du_du_ut = ut_du - Nx.dot(Nx.LinAlg.adjoint(du), [-1], batch_axes, u, [-2], batch_axes)
+
+    first_component_du =
+      u
+      |> Nx.dot([-1], batch_axes, f * ut_du_du_ut, [-2], batch_axes)
+      |> Nx.dot([-1], batch_axes, s, [-2], batch_axes)
+
+    # (I - U Uᴴ) du = du - U (Uᴴ du) — avoid materializing eye_m
+    second_component_du =
+      (du - Nx.dot(u, [-1], batch_axes, ut_du, [-2], batch_axes))
+      |> Nx.dot([-1], batch_axes, s_inv, [-2], batch_axes)
+
+    du_component =
+      Nx.dot(first_component_du + second_component_du, [-1], batch_axes, vt, [-2], batch_axes)
+
+    ds_component =
+      u
+      |> Nx.dot([-1], batch_axes, ds_matrix, [-2], batch_axes)
+      |> Nx.dot([-1], batch_axes, vt, [-2], batch_axes)
+
+    first_dvt_component =
+      (Nx.dot(vt, [-1], batch_axes, Nx.LinAlg.adjoint(dvt), [-2], batch_axes) -
+         Nx.dot(dvt, [-1], batch_axes, Nx.LinAlg.adjoint(vt), [-2], batch_axes)) * f
+
+    first_dvt_component =
+      s
+      |> Nx.dot([-1], batch_axes, first_dvt_component, [-2], batch_axes)
+      |> Nx.dot([-1], batch_axes, vt, [-2], batch_axes)
+
+    # X (I - V Vᴴ) = X - (X V) Vᴴ — avoid materializing eye_n (V = vtᴴ)
+    dvt_s_inv = Nx.dot(s_inv, [-1], batch_axes, dvt, [-2], batch_axes)
+
+    second_dvt_component =
+      dvt_s_inv -
+        Nx.dot(
+          Nx.dot(dvt_s_inv, [-1], batch_axes, Nx.LinAlg.adjoint(vt), [-2], batch_axes),
+          [-1],
+          batch_axes,
+          vt,
+          [-2],
+          batch_axes
+        )
+
+    dvt_component =
+      Nx.dot(u, [-1], batch_axes, first_dvt_component + second_dvt_component, [-2], batch_axes)
+
+    da = du_component + ds_component + dvt_component
+    add_extra_u_term(da, u_full, du_full, u, s_inv, vt)
+  end
+
+  # Full-matrices leftover columns U2 (tall) or V2 (wide, after adjoint swap).
+  # dA += -U2 dU2ᴴ U1 S⁻¹ Vᴴ
+  # Giles NA-08-01 §3: https://people.maths.ox.ac.uk/gilesm/files/NA-08-01.pdf
+  # TensorFlow _SvdGrad: leftover V2 term after the thin VJP.
+  deftransformp add_extra_u_term(da, u, du, u1, s_inv, vt) do
+    rank = tuple_size(Nx.shape(u))
+    u_cols = elem(Nx.shape(u), rank - 1)
+    k = elem(Nx.shape(u1), rank - 1)
+
+    if u_cols > k do
+      ba = batch_axes(u)
+      u2 = Nx.slice_along_axis(u, k, u_cols - k, axis: -1)
+      du2 = Nx.slice_along_axis(du, k, u_cols - k, axis: -1)
+
+      u2_du2h = Nx.dot(u2, [-1], ba, Nx.LinAlg.adjoint(du2), [-2], ba)
+
+      u1_sinv_vt =
+        u1
+        |> Nx.dot([-1], ba, s_inv, [-2], ba)
+        |> Nx.dot([-1], ba, vt, [-2], ba)
+
+      Nx.subtract(da, Nx.dot(u2_du2h, [-1], ba, u1_sinv_vt, [-2], ba))
+    else
+      da
+    end
+  end
+
+  deftransformp batch_axes(t) do
+    rank = tuple_size(t.shape)
+    Enum.to_list(0..(rank - 3)//1)
+  end
+
+  deftransformp eye_from_vector(t) do
+    shape = Nx.shape(t)
+    k = elem(shape, tuple_size(shape) - 1)
+    batch = Tuple.delete_at(shape, tuple_size(shape) - 1)
+
+    eye_shape =
+      batch
+      |> Tuple.insert_at(tuple_size(batch), k)
+      |> Tuple.insert_at(tuple_size(batch) + 1, k)
+
+    Nx.eye(eye_shape)
+  end
+
+  deftransformp slice_last_matrix(t, rows, cols) do
+    shape = Nx.shape(t)
+    rank = tuple_size(shape)
+    starts = List.duplicate(0, rank)
+
+    lengths =
+      shape
+      |> Tuple.to_list()
+      |> Enum.with_index()
+      |> Enum.map(fn {dim, i} ->
+        cond do
+          i == rank - 2 -> rows
+          i == rank - 1 -> cols
+          true -> dim
+        end
+      end)
+
+    Nx.slice(t, starts, lengths)
+  end
+end

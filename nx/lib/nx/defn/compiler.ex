@@ -3,52 +3,111 @@ defmodule Nx.Defn.Compiler do
   The specification and helper functions for custom `defn` compilers.
   """
 
-  @type expr :: Nx.t() | tuple() | %{optional(term()) => expr()}
-
   @doc """
-  Callback for JIT compilation.
+  Callback for compilation.
 
   It receives an opaque `key` used for caching, the function
-  `vars`, the function which builds an expression, and the compiler
-  options.
+  `vars`, the function `fun` which builds a defn expression,
+  a list of argument list in `args_list`, and the compiler options.
 
-  It must call `fun` with the vars as a list of arguments.
-  Note the `key` does not include the `vars` in its cache.
-  Therefore, if you want to cache the result of `fun.(vars)`,
-  you likely want to include the vars in the cache key.
-  Given `vars` are all tensors, it is often a matter of
-  retrieving its type, shape, and names.
+  It must call `fun` with the `vars` as arguments. Note the `key`
+  does not include the `vars` in its cache. Therefore, if you want
+  to cache the result of `fun.(vars)`, you likely want to include
+  the vars in the cache key. `vars` is a list of containers expressions.
+
+  Once the expression is built and compiled, it must be invoked
+  for each list of arguments in `args_list`. In a nutshell, `vars`
+  are used to build the expression from `fun` which is then
+  invoked for each list of arguments in `args_list`. All lists
+  in `args_list` are guaranteed to be flat lists of the same length,
+  containing zero-arity functions that return tensors of the same type,
+  shape, and name.
 
   The callback uses double underscores so it can be defined
   at root modules without affecting the module's main API.
   """
   @callback __jit__(
               key :: term,
-              vars :: [Nx.t()],
-              ([Nx.t()] -> expr()),
+              vars,
+              fun :: (vars -> Nx.Container.t()),
+              args_list :: [[(-> Nx.Tensor.t())]],
               opts :: keyword
-            ) :: expr
+            ) :: [Nx.Container.t()]
+            when vars: [Nx.Container.t()]
 
   @doc """
-  Callback for streaming (on top of JIT compilation).
+  Callback for compilation.
 
-  It receives the same arguments as `c:__jit__/4` with the addition
-  of the streaming and accumulator templates. It must return a struct
-  that implements the `Nx.Stream` protocol.
+  It receives an opaque `key` used for caching, the function
+  `vars`, the function `fun` which builds a defn expression,
+  and the compiler options. It must call `fun` with the `vars`
+  as arguments.
+
+  It returns a function that receives a list of arguments and
+  returns a list of results.
+
+  The callback uses double underscores so it can be defined
+  at root modules without affecting the module's main API.
   """
-  @callback __stream__(
+  @callback __compile__(
               key :: term,
-              stream,
-              acc,
-              vars :: [Nx.t()],
-              ([Nx.t()] -> acc),
+              vars :: vars,
+              fun :: (vars -> Nx.Container.t()),
               opts :: keyword
-            ) :: Nx.Stream.t()
-            when stream: expr(), acc: expr()
+            ) :: ([[Nx.Tensor.t()]] -> [Nx.Container.t()])
+            when vars: [Nx.Container.t()]
+
+  @doc """
+  Receives a keyword list of compiler options and
+  returns a list of compiler options, each to run
+  on a separate partition/device.
+  """
+  @callback __partitions_options__(keyword) :: [keyword]
+
+  @doc """
+  Receives a keyword list of compiler options and returns a backend
+  with options that corresponds to the same allocation.
+
+  The backend is expected to match what would be returned from a
+  computation defined by the compiler.
+  """
+  @callback __to_backend__(keyword) :: {module, keyword}
+
+  @doc """
+  Callback for compilation of a parallelizable computation.
+
+  Its main purpose is to compile a function for a given `Nx.Mesh`.
+
+  Receives an opaque `key` used for caching, a `mesh`, a list of `vars`
+  in `[vars]`, the function `fun` which builds a defn expression, a list of
+  argument lists in `args_list`, and the compiler options.
+
+  Using `[vars]` instead of a single `vars` allows the compiler to keep one
+  set of abstract parameters per shard or logical device in the mesh. This is useful
+  when the tensors are already divided into shards.
+  """
+  @callback __shard_jit__(
+              key :: term,
+              mesh :: Nx.Mesh.t(),
+              [vars],
+              fun :: (vars -> Nx.Container.t()),
+              args_list :: [[(-> Nx.Tensor.t())]],
+              opts :: keyword
+            ) :: [Nx.Container.t()]
+            when vars: [Nx.Container.t()]
+
+  @optional_callbacks [
+    __shard_jit__: 6
+  ]
+
+  # Modules allowed in defn
+  @allowed_modules [Nx.Constants, Nx.Defn, Nx.Defn.Kernel, Nx.LinAlg, Nx.Type]
 
   # These operations do not have valid meaning for Nx.Defn.Expr
-  @forbidden_ops [:backend_copy, :backend_deallocate, :backend_transfer] ++
-                   [:to_binary, :to_scalar, :to_flat_list, :to_heatmap, :to_batched_list]
+  @forbidden_ops [:backend_copy, :backend_deallocate, :backend_transfer, :to_list] ++
+                   [:to_binary, :to_number, :to_flat_list, :to_heatmap, :to_batched] ++
+                   [:load_numpy, :load_numpy_archive!, :compatible?, :default_backend] ++
+                   [:serialize, :deserialize, :from_pointer, :to_pointer]
 
   defguardp is_var(var)
             when is_tuple(var) and tuple_size(var) == 3 and is_atom(elem(var, 0)) and
@@ -67,46 +126,108 @@ defmodule Nx.Defn.Compiler do
     Process.get(Nx.Defn.Compiler)
   end
 
+  @doc """
+  Returns if we are inside `defn` at _compilation time_.
+
+  This would be invoked inside a macro that has specific `defn` logic.
+  """
+  def defn?() do
+    Process.get(Nx.Defn, false)
+  end
+
+  @doc false
+  def __to_backend__(opts) do
+    {compiler, opts} = Keyword.pop(opts, :compiler, Nx.Defn.Evaluator)
+    compiler.__to_backend__(opts)
+  rescue
+    e in [UndefinedFunctionError] ->
+      raise_missing_callback(e, :__to_backend__, 1, __STACKTRACE__)
+  end
+
   ## JIT/Stream
 
   @doc false
-  def __jit__(fun, args, opts) do
-    {compiler, tail} = runtime(fun, args, opts)
-    Kernel.apply(compiler, :__jit__, [fun | tail])
+  def __compile__(fun, params, opts) do
+    {compiler, runtime_fun, opts} = prepare_options(fun, opts)
+    compiler.__compile__(fun, params, runtime_fun, opts)
+  rescue
+    e in [UndefinedFunctionError] ->
+      raise_missing_callback(e, :__compile__, 4, __STACKTRACE__)
   end
 
   @doc false
-  def __stream__(fun, input, acc, args, opts) do
-    {compiler, tail} = runtime(fun, [input, acc | args], opts)
-    Kernel.apply(compiler, :__stream__, [fun, input, acc | tail])
+  def __jit__(fun, params, args_list, opts) do
+    {compiler, runtime_fun, opts} = prepare_options(fun, opts)
+    compiler.__jit__(fun, params, runtime_fun, args_list, opts)
+  rescue
+    e in [UndefinedFunctionError] ->
+      raise_missing_callback(e, :__jit__, 5, __STACKTRACE__)
   end
 
-  defp runtime(fun, args, opts) do
-    {compiler, opts} = Keyword.pop(opts, :compiler, Nx.Defn.Evaluator)
-    tensors = Nx.Defn.Tree.from_runtime_args(args)
-    runtime_fun = &runtime_fun(&1, fun, args, compiler)
-    {compiler, [tensors, runtime_fun, opts]}
-  end
+  defp raise_missing_callback(exception, name, arity, stacktrace) do
+    case exception do
+      %UndefinedFunctionError{module: compiler, function: ^name, arity: ^arity} ->
+        raise ArgumentError,
+              "the expected compiler callback #{name}/#{arity} is missing. Please check that the module #{inspect(compiler)} is an Nx.Defn.Compiler"
 
-  defp runtime_fun(tensors, fun, args, compiler) do
-    if Process.get(Nx.Defn.Compiler) do
-      raise "cannot trigger JIT compilation when there is already a JIT compilation happening"
+      _ ->
+        # This is not an error that should've been caught by this function, so we pass the exception along
+        reraise exception, stacktrace
     end
+  end
 
-    Process.put(Nx.Defn.Compiler, compiler)
+  defp prepare_options(fun, opts) do
+    {compiler, opts} = Keyword.pop(opts, :compiler, Nx.Defn.Evaluator)
+    {compiler, &runtime_fun(&1, fun, compiler), opts}
+  end
+
+  defp runtime_fun(args, fun, compiler) do
+    previous_backend = Process.put(Nx.Shared.backend_pdict_key(), {Nx.Defn.Expr, []})
+    previous = Process.put(Nx.Defn.Compiler, compiler)
 
     try do
-      args = Nx.Defn.Tree.args_to_params(args, tensors)
-
       fun
       |> apply(args)
-      |> Nx.Defn.Tree.to_result()
+      |> Nx.Defn.Composite.traverse(&Nx.Defn.Expr.tensor/1)
     after
-      Process.delete(Nx.Defn.Compiler)
+      if previous_backend do
+        Process.put(Nx.Shared.backend_pdict_key(), previous_backend)
+      else
+        Process.delete(Nx.Shared.backend_pdict_key())
+      end
+
+      if previous do
+        Process.put(Nx.Defn.Compiler, compiler)
+      else
+        Process.delete(Nx.Defn.Compiler)
+      end
     end
   end
 
   ## Compiler
+
+  @doc false
+  def __case__(arg) when is_tuple(arg) do
+    arg |> Tuple.to_list() |> Enum.each(&__case__/1)
+    arg
+  end
+
+  def __case__(arg) when is_number(arg) or is_atom(arg) do
+    arg
+  end
+
+  def __case__(%_{} = arg) do
+    arg
+  end
+
+  def __case__(arg) do
+    raise ArgumentError, """
+    only tuples, atoms, numbers, and structs are allowed as arguments to case/2 inside defn.
+    Got: #{inspect(arg)}
+
+    Consider using deftransform/2 or deftransformp/2 if you need to handle more complex cases
+    """
+  end
 
   @doc false
   def __remote__(module, function, defn, args) do
@@ -120,8 +241,20 @@ defmodule Nx.Defn.Compiler do
               if function_exported?(module, function, length(args)) do
                 formatted = Exception.format_mfa(module, function, length(args))
 
-                reraise "cannot invoke #{formatted} inside defn because it was not defined with defn",
-                        stack
+                message =
+                  "cannot invoke #{formatted} inside defn because it was not defined with defn"
+
+                detail =
+                  case module do
+                    IO ->
+                      ". To print the runtime value of a tensor, use print_value/2. " <>
+                        "To print the tensor expression, use print_expr/2"
+
+                    _ ->
+                      ""
+                  end
+
+                reraise message <> detail, stack
               else
                 [{module, function, args_or_arity, info} | stack]
               end
@@ -136,27 +269,60 @@ defmodule Nx.Defn.Compiler do
 
   @doc false
   def __compile__(%Macro.Env{module: module, file: file, line: line}, exports) do
-    defns =
-      for {{name, arity}, %{defaults: defaults}} <- exports,
-          arity <- (arity - map_size(defaults))..arity,
-          do: {name, arity}
+    {defn_exports, transform_exports} =
+      Enum.split_with(exports, fn {_fun_arity, meta} -> meta.type == :numerical end)
+
+    defns = compile_prepare_arities(defn_exports)
+    transforms = compile_prepare_arities(transform_exports)
 
     state = %{
       module: module,
       file: file,
       line: line,
       function: nil,
-      defns: MapSet.new(defns),
+      defns: defns,
+      transforms: transforms,
       rewrite_underscore?: false
     }
 
-    quoted = Enum.map(exports, &compile_each(&1, state))
+    quoted =
+      Enum.map(transform_exports, &compile_each_transform(&1, state)) ++
+        Enum.map(defn_exports, &compile_each_defn(&1, state))
+
     {:__block__, [], quoted}
   end
 
-  defp compile_each({{name, arity} = def, def_meta}, state) do
-    %{compiler: {def_module, def_opts}, defaults: defaults} = def_meta
-    {{kind, _meta, args, ast}, state} = get_and_normalize_definition(def, state)
+  def __shard_jit__(fun, mesh, params, args_list, opts) do
+    {input_shardings, opts} = Keyword.pop(opts, :input_shardings)
+
+    # Container arguments (e.g. an Axon.ModelState) are flattened into their
+    # tensor leaves here, once, so every compiler backend receives an already
+    # validated and expanded (one entry per leaf) `:input_shardings` list,
+    # the same way `to_lazy_params_sharded/2` already flattens `args_list`
+    # into per-leaf functions for regular compilation.
+    {input_shardings, multipliers} =
+      validate_and_convert_input_shardings!(mesh, input_shardings, params)
+
+    params = calculate_unsharded_inputs(params, multipliers)
+    opts = Keyword.put(opts, :input_shardings, input_shardings)
+
+    {module, runtime_fun, opts} = prepare_options(fun, opts)
+    module.__shard_jit__(fun, mesh, params, runtime_fun, args_list, opts)
+  rescue
+    e in [UndefinedFunctionError] ->
+      raise_missing_callback(e, :__shard_jit__, 6, __STACKTRACE__)
+  end
+
+  defp compile_prepare_arities(definitions) do
+    for {{name, arity}, %{defaults: defaults}} <- definitions,
+        arity <- (arity - map_size(defaults))..arity,
+        into: MapSet.new(),
+        do: {name, arity}
+  end
+
+  defp compile_each_defn({{name, arity} = def, def_meta}, state) do
+    %{defaults: defaults} = def_meta
+    {{kind, _meta, args, ast}, state} = get_and_normalize_defn(def, state)
 
     defn_name = defn_name(name)
 
@@ -169,66 +335,73 @@ defmodule Nx.Defn.Compiler do
       end)
 
     all_args = Macro.generate_arguments(arity, __MODULE__)
+    Module.delete_definition(state.module, def)
 
-    fn_args =
-      for {arg, i} <- Enum.with_index(all_args),
-          not Map.has_key?(defaults, i),
-          do: arg
-
-    fun =
-      if defaults == [] do
-        quote do
-          &(unquote(Macro.var(defn_name, __MODULE__)) / unquote(arity))
-        end
-      else
-        quote do
-          fn unquote_splicing(fn_args) -> unquote(defn_name)(unquote_splicing(all_args)) end
+    entrypoint =
+      quote line: state.line do
+        Kernel.unquote(kind)(unquote(name)(unquote_splicing(all_args))) do
+          if Process.get(Nx.Defn.Compiler) do
+            unquote(defn_name)(unquote_splicing(all_args))
+          else
+            Nx.Defn.jit_apply(
+              &(unquote(Macro.var(defn_name, __MODULE__)) / unquote(arity)),
+              unquote(all_args)
+            )
+          end
         end
       end
 
-    quote line: state.line do
-      Module.delete_definition(__MODULE__, unquote(def))
+    impl =
+      quote line: state.line do
+        Kernel.unquote(kind)(unquote(defn_name)(unquote_splicing(defn_args)), do: unquote(ast))
+      end
 
-      Kernel.unquote(kind)(unquote(name)(unquote_splicing(all_args))) do
-        if Process.get(Nx.Defn.Compiler) do
-          unquote(defn_name)(unquote_splicing(all_args))
-        else
-          fun = unquote(fun)
-          args = unquote(fn_args)
-          {cache, tensors} = Nx.Defn.Tree.from_compile_args(args, fun)
+    {strip_definition_context(entrypoint), impl}
+  end
 
-          unquote(def_module).__jit__(
-            cache,
-            Nx.Defn.Tree.from_runtime_args(tensors),
-            fn tensors ->
-              Process.put(Nx.Defn.Compiler, unquote(def_module))
+  # If the definition has a context, we don't warn when it goes unused,
+  # so we remove the context as we want to keep the original semantics.
+  defp strip_definition_context({kind, meta, [signature, block]}) do
+    {kind, meta, [Macro.update_meta(signature, &Keyword.delete(&1, :context)), block]}
+  end
 
-              try do
-                args = Nx.Defn.Tree.args_to_params(args, tensors)
+  defp compile_each_transform({{name, defn_arity}, def_meta}, state) do
+    defn_name = defn_name(name)
 
-                fun
-                |> apply(args)
-                |> Nx.Defn.Tree.to_result()
-              after
-                Process.delete(Nx.Defn.Compiler)
-              end
-            end,
-            unquote(Macro.escape(def_opts))
+    %{defaults: defaults} = def_meta
+
+    case Module.get_definition(state.module, {name, defn_arity}) do
+      {:v1, kind, meta, _clauses} ->
+        all_args = Macro.generate_arguments(defn_arity, __MODULE__)
+
+        defn_args =
+          Enum.with_index(all_args, fn arg, i ->
+            case defaults do
+              %{^i => {meta, default}} -> {:\\, meta, [arg, default]}
+              %{} -> arg
+            end
+          end)
+
+        quote line: meta[:line] do
+          Kernel.unquote(kind)(unquote(defn_name)(unquote_splicing(defn_args)),
+            do: unquote(name)(unquote_splicing(all_args))
           )
         end
-      end
 
-      Kernel.unquote(kind)(unquote(defn_name)(unquote_splicing(defn_args)), do: unquote(ast))
+      _ ->
+        nil
     end
   end
 
-  defp get_and_normalize_definition(def, state) do
+  defp get_and_normalize_defn({name, arity} = def, state) do
     {:v1, kind, meta, clauses} = Module.get_definition(state.module, def)
     state = %{state | function: def, line: meta[:line] || state.line, rewrite_underscore?: true}
 
+    type_str = if kind == :def, do: "defn", else: "defnp"
+
     case clauses do
       [] ->
-        compile_error!(meta, state, "cannot have #{kind}n without clauses")
+        compile_error!(meta, state, "cannot have #{type_str} #{name}/#{arity} without clauses")
 
       [{meta, args, [], ast}] ->
         {args, state} = normalize_args(args, meta, state)
@@ -236,7 +409,11 @@ defmodule Nx.Defn.Compiler do
         {{kind, meta, args, ast}, state}
 
       [_, _ | _] ->
-        compile_error!(meta, state, "cannot compile #{kind}n with multiple clauses")
+        compile_error!(
+          meta,
+          state,
+          "cannot compile #{type_str} #{name}/#{arity} with multiple clauses"
+        )
     end
   end
 
@@ -257,6 +434,25 @@ defmodule Nx.Defn.Compiler do
     {map, state} = normalize(map, state)
     {args, state} = normalize(args, state)
     {{:%{}, meta, [{:|, update_meta, [map, args]}]}, state}
+  end
+
+  defp normalize({:<<>>, meta, args}, state) do
+    {args, state} =
+      Enum.map_reduce(args, state, fn {:"::", meta, [left, right]}, acc ->
+        {left, acc} =
+          case left do
+            {{:., _, [String.Chars, :to_string]} = dot, dot_meta, [left]} ->
+              {left, acc} = normalize(left, acc)
+              {{dot, dot_meta, [left]}, acc}
+
+            _ ->
+              normalize(left, acc)
+          end
+
+        {{:"::", meta, [left, right]}, acc}
+      end)
+
+    {{:<<>>, meta, args}, state}
   end
 
   defp normalize({special_form, meta, args}, state)
@@ -291,43 +487,108 @@ defmodule Nx.Defn.Compiler do
     {{:fn, meta, clauses}, state}
   end
 
-  defp normalize({:cond, meta, [[do: clauses]]}, state) do
-    {[{last_meta, {last_condition, last_expr}} | rest], state} =
-      Enum.reduce(clauses, {[], state}, fn {:->, meta, [[condition], expr]}, {acc, state} ->
-        {condition, state} = normalize(condition, state)
-        {expr, state} = normalize(expr, state)
-        {[{meta, {condition, expr}} | acc], state}
+  defp normalize({:case, meta, [expr, [do: clauses]]}, state) do
+    {expr, state} = normalize(expr, state)
+
+    {clauses, state} =
+      Enum.map_reduce(clauses, state, fn {:->, clause_meta, [[head], body]}, state ->
+        {when_meta, pattern, guard} =
+          case head do
+            {:when, when_meta, [pattern, guard]} -> {when_meta, pattern, guard}
+            _ -> {clause_meta, head, true}
+          end
+
+        {pattern, vars} =
+          Macro.postwalk(pattern, %{}, fn
+            {:%{}, meta, [_ | _]} = map, _acc ->
+              compile_error!(
+                meta,
+                state,
+                "case/2 in defn does not allow matching on keys of maps and structs in patterns. Got: #{Macro.to_string(map)}"
+              )
+
+            {var, _meta, ctx} = triplet, acc when is_atom(var) and is_atom(ctx) ->
+              {normalize_var(triplet), Map.put(acc, {var, ctx}, true)}
+
+            other, acc ->
+              {other, acc}
+          end)
+
+        guard =
+          Macro.postwalk(guard, fn
+            {var, meta, ctx} = triplet when is_atom(var) and is_atom(ctx) ->
+              if is_map_key(vars, {var, ctx}) do
+                normalize_var(triplet)
+              else
+                compile_error!(
+                  meta,
+                  state,
+                  "case/2 in defn allow guards to only access variables defined in patterns. Got: #{var}"
+                )
+              end
+
+            other ->
+              other
+          end)
+
+        {body, state} = normalize(body, state)
+        {{:->, clause_meta, [[{:when, when_meta, [pattern, guard]}], body]}, state}
       end)
 
-    if rest == [] do
-      compile_error!(meta, state, "cond must have at least 2 clauses, got 1")
-    end
+    wrapped = {{:., meta, [__MODULE__, :__case__]}, meta, [expr]}
+    {{:case, meta, [wrapped, [do: clauses]]}, state}
+  end
 
-    if not is_atom(last_condition) or last_condition == nil or last_condition == false do
-      compile_error!(
-        last_meta,
-        state,
-        "expected the last clause of cond to match on an atom, " <>
-          "such as true or :otherwise, got: #{Macro.to_string(last_condition)}"
-      )
-    end
+  @cond_var_ast {:condition, [], __MODULE__}
+
+  defp normalize({:cond, _meta, [[do: clauses]]}, state) do
+    {clauses, state} =
+      Enum.map_reduce(clauses, state, fn {:->, meta, [[condition], expr]}, state ->
+        {condition, state} = normalize(condition, state)
+        {expr, state} = normalize(expr, state)
+
+        pair =
+          quote do
+            unquote(@cond_var_ast) = unquote(condition)
+            {unquote(@cond_var_ast), fn -> unquote(expr) end}
+          end
+
+        {{meta, pair}, state}
+      end)
 
     ast =
       quote do
-        Nx.Defn.Expr.cond(unquote(state.file), unquote(Enum.reverse(rest)), unquote(last_expr))
+        Nx.Defn.Expr.defn_cond(
+          unquote(state.file),
+          unquote(clauses)
+        )
       end
 
     {ast, state}
   end
 
-  defp normalize({name, meta, args} = expr, state) when is_atom(name) and is_list(args) do
-    pair = {name, length(args)}
+  defp normalize({name, meta, args}, state) when is_atom(name) and is_list(args) do
+    arity = length(args)
+    pair = {name, arity}
 
-    if pair in state.defns do
-      {args, state} = normalize_list(args, state)
-      {{defn_name(name), meta, args}, state}
-    else
-      invalid_numerical_expression!(expr, state)
+    cond do
+      pair in state.defns or pair in state.transforms ->
+        {args, state} = normalize_list(args, state)
+        {{name, meta, args}, state}
+
+      Module.defines?(state.module, {name, arity}) ->
+        compile_error!(
+          meta,
+          state,
+          "cannot use function #{name}/#{arity} inside defn because it was not defined with defn"
+        )
+
+      true ->
+        compile_error!(
+          meta,
+          state,
+          "undefined function #{name}/#{arity} (there is no such import)"
+        )
     end
   end
 
@@ -345,27 +606,71 @@ defmodule Nx.Defn.Compiler do
     {{{:., dot_meta, [fun]}, meta, args}, state}
   end
 
-  defp normalize({{:., _, [Nx.Defn.Kernel, :transform]} = call, meta, [ast, fun]}, state) do
+  defp normalize({{:., _, [Nx.Defn.Kernel, :io_call]} = call, meta, [ast | rest]}, state) do
     {ast, state} = normalize(ast, state)
-
-    fun =
-      Macro.prewalk(fun, fn
-        var when is_var(var) -> normalize_var(var)
-        node -> node
-      end)
-
-    {{call, meta, [ast, fun]}, state}
+    {{call, meta, [ast | rest]}, state}
   end
 
-  defp normalize({{:., dot_meta, [mod, name]}, meta, args}, state)
-       when mod in [Nx, Nx.LinAlg, Nx.Defn, Nx.Defn.Kernel] do
+  defp normalize({{:., _, [:erlang, :error]} = dot, meta, args}, state) do
+    {args, state} = normalize_list(args, state)
+    {{dot, meta, args}, state}
+  end
+
+  defp normalize({{:., _, [_, :exception]} = dot, meta, [arg]}, state) do
+    {arg, state} = normalize(arg, state)
+    {{dot, meta, [arg]}, state}
+  end
+
+  defp normalize({{:., dot_meta, [Nx, name]}, meta, args}, state) do
     if name in @forbidden_ops do
-      mfa = Exception.format_mfa(mod, name, length(args))
+      mfa = Exception.format_mfa(Nx, name, length(args))
       compile_error!(meta, state, "#{mfa} is not allowed inside defn")
     end
 
+    if name == :tensor and args != [] and not Macro.quoted_literal?(hd(args)) do
+      warn(meta, state, """
+      Nx.tensor/2 inside defn expects the first argument to be a literal (such as a list)
+
+      You must avoid code such as:
+
+          Nx.tensor(opts[:key])
+
+      As that will JIT compile a different function for each different key.
+      Those values must be literals or be converted to tensors by explicitly \
+      calling Nx.tensor/2 outside of a defn
+      """)
+    end
+
+    if name == :runtime_call do
+      validate_runtime_call!(args, meta, state)
+    end
+
     {args, state} = normalize_list(args, state)
-    args = rewrite_args(name, args)
+
+    {{{:., dot_meta, [Nx, name]}, meta, args}, state}
+  end
+
+  # We also allow specifically Complex.new so that literal complex numbers
+  # can be written in defn.
+  defp normalize({{:., dot_meta, [Complex, :new]}, meta, args}, state) do
+    {args, state} = normalize_list(args, state)
+    {{{:., dot_meta, [Complex, :new]}, meta, args}, state}
+  end
+
+  defp normalize({{:., dot_meta, [Nx.Constants, :i]}, meta, []}, state) do
+    {{{:., dot_meta, [Complex, :new]}, meta, [0, 1]}, state}
+  end
+
+  defp normalize({{:., dot_meta, [Nx.Constants, :e]}, meta, []}, state) do
+    {{{:., dot_meta, [:math, :exp]}, meta, [1]}, state}
+  end
+
+  defp normalize({{:., dot_meta, [Nx.Constants, :pi]}, meta, []}, state) do
+    {{{:., dot_meta, [:math, :pi]}, meta, []}, state}
+  end
+
+  defp normalize({{:., dot_meta, [mod, name]}, meta, args}, state) when mod in @allowed_modules do
+    {args, state} = normalize_list(args, state)
     {{{:., dot_meta, [mod, name]}, meta, args}, state}
   end
 
@@ -382,9 +687,10 @@ defmodule Nx.Defn.Compiler do
      state}
   end
 
-  defp normalize({{:., dot_meta, [remote, name]}, meta, []}, state) when is_atom(name) do
+  defp normalize({{:., dot_meta, [remote, name]}, meta, args}, state) when is_atom(name) do
     {remote, state} = normalize(remote, state)
-    {{{:., dot_meta, [Map, :fetch!]}, meta, [remote, name]}, state}
+    {args, state} = normalize_list(args, state)
+    {{{:., dot_meta, [remote, name]}, meta, args}, state}
   end
 
   defp normalize({left, right}, state) do
@@ -427,34 +733,53 @@ defmodule Nx.Defn.Compiler do
     )
   end
 
-  ## Rewrite args
+  defp validate_runtime_call!(args, meta, state) do
+    case args do
+      [_out, _arg, fun] ->
+        validate_runtime_call_capture!(fun, meta, state)
 
-  defp rewrite_args(:tensor, [t]), do: [t, add_backend([])]
-  defp rewrite_args(:tensor, [t, opts]), do: [t, add_backend(opts)]
+      [_out, _arg, _opts, fun] ->
+        validate_runtime_call_capture!(fun, meta, state)
 
-  defp rewrite_args(:from_binary, [bin, type]), do: [bin, type, add_backend([])]
-  defp rewrite_args(:from_binary, [bin, type, opts]), do: [bin, type, add_backend(opts)]
+      _ ->
+        raise UndefinedFunctionError,
+              "function Nx.runtime_call/#{length(args)} is undefined. Did you mean runtime_call/3 or runtime_call/4?"
+    end
+  end
 
-  defp rewrite_args(:iota, [t]), do: [t, add_backend([])]
-  defp rewrite_args(:iota, [t, opts]), do: [t, add_backend(opts)]
+  defp validate_runtime_call_capture!({:fn, _, _}, meta, state) do
+    compile_error!(
+      meta,
+      state,
+      "Nx.runtime_call inside defn requires a named capture (e.g. &my_callback/2), " <>
+        "anonymous functions are not allowed. Use a defp or def function and pass it as &name/2"
+    )
+  end
 
-  defp rewrite_args(:eye, [n]), do: [n, add_backend([])]
-  defp rewrite_args(:eye, [n, opts]), do: [n, add_backend(opts)]
+  # Require :& with only argument being {:/, _, [_, 2]}, which covers local and remote captures
+  defp validate_runtime_call_capture!({:&, _, [arg]}, meta, state) do
+    case arg do
+      {:/, _, [_, 2]} ->
+        :ok
 
-  defp rewrite_args(:random_uniform, [t]), do: [t, add_backend([])]
-  defp rewrite_args(:random_uniform, [t, opts]), do: [t, add_backend(opts)]
-  defp rewrite_args(:random_uniform, [t, min, max]), do: [t, min, max, add_backend([])]
-  defp rewrite_args(:random_uniform, [t, min, max, opts]), do: [t, min, max, add_backend(opts)]
+      {:/, _, [_, arity]} ->
+        compile_error!(
+          meta,
+          state,
+          "Nx.runtime_call inside defn requires a named capture with arity 2 (e.g. &my_callback/2), " <>
+            "got arity #{arity}"
+        )
+    end
+  end
 
-  defp rewrite_args(:random_normal, [t]), do: [t, add_backend([])]
-  defp rewrite_args(:random_normal, [t, opts]), do: [t, add_backend(opts)]
-  defp rewrite_args(:random_normal, [t, mu, sigma]), do: [t, mu, sigma, add_backend([])]
-  defp rewrite_args(:random_normal, [t, mu, sigma, opts]), do: [t, mu, sigma, add_backend(opts)]
-
-  defp rewrite_args(_name, args), do: args
-
-  defp add_backend(list) when is_list(list), do: [backend: Nx.Defn.Expr] ++ list
-  defp add_backend(expr), do: quote(do: Keyword.put(unquote(expr), :backend, Nx.Defn.Expr))
+  defp validate_runtime_call_capture!(capture, meta, state) do
+    compile_error!(
+      meta,
+      state,
+      "Nx.runtime_call inside defn requires a named capture with arity 2 (e.g. &my_callback/2), " <>
+        "got: #{Macro.to_string(capture)}"
+    )
+  end
 
   ## Normalize args
 
@@ -472,14 +797,14 @@ defmodule Nx.Defn.Compiler do
     end
   end
 
-  defp normalize_arg({:%, meta, [aliases, {:%{}, meta, args}]}, _meta, state) do
+  defp normalize_arg({:%, meta1, [aliases, {:%{}, meta2, args}]}, _meta, state) do
     {args, state} =
       Enum.map_reduce(args, state, fn {k, v}, acc ->
-        {v, acc} = normalize_arg(v, meta, acc)
+        {v, acc} = normalize_arg(v, meta1, acc)
         {{k, v}, acc}
       end)
 
-    {{:%, meta, [aliases, {:%{}, meta, args}]}, state}
+    {{:%, meta1, [aliases, {:%{}, meta2, args}]}, state}
   end
 
   defp normalize_arg({:%{}, meta, args}, _meta, state) do
@@ -537,6 +862,209 @@ defmodule Nx.Defn.Compiler do
     :ok
   end
 
+  ## Params manipulation
+
+  @doc false
+  def fun(arity, callback)
+
+  for i <- 0..128 do
+    args = Macro.generate_arguments(i, __MODULE__)
+
+    def fun(unquote(i), callback) do
+      fn unquote_splicing(args) -> callback.(unquote(args)) end
+    end
+  end
+
+  @doc false
+  def to_lazy_params_sharded(fun, args_list) do
+    # Multiple args lists (for sharding): [[args1], [args2], [args3]]
+    # Returns: {fun, params, templates, [flatten1, flatten2, flatten3]}
+    # Each flatten is kept separate - we do NOT concatenate them
+    [first_args | rest_args] = args_list
+    {fun, params, templates, first_flatten} = to_lazy_params(fun, first_args)
+
+    # Build flattens for remaining args lists
+    # Each flatten remains separate: [[lazy1, lazy2], [lazy3, lazy4], ...]
+    rest_flattens =
+      Enum.map(rest_args, fn args ->
+        {_, _, _, flatten} = to_lazy_params(fun, args)
+        flatten
+      end)
+
+    {fun, params, templates, [first_flatten | rest_flattens]}
+  end
+
+  defp validate_and_convert_input_shardings!(mesh, input_shardings, vars) do
+    unless is_list(input_shardings) do
+      raise ArgumentError,
+            "input_shardings are required for sharding, see Nx.Defn.shard_jit/3 for more information"
+    end
+
+    num_params = length(vars)
+    num_shardings = length(input_shardings)
+
+    if num_shardings != num_params do
+      raise ArgumentError,
+            "expected #{num_params} input sharding configuration(s), got #{num_shardings}"
+    end
+
+    all_axes =
+      mesh.shape
+      |> tuple_size()
+      |> then(&Enum.to_list(0..(&1 - 1)//1))
+      |> MapSet.new()
+
+    # Each entry in `vars` is one argument to the jitted function, which may itself
+    # be a container (e.g. a struct implementing Nx.Container) wrapping several
+    # tensors. The same sharding spec applies to every tensor leaf found in that
+    # argument, so we validate and convert it once per leaf rather than assuming
+    # `var` is a plain %Nx.Tensor{}.
+    per_var_results =
+      Enum.zip_with(input_shardings, vars, fn input_sharding, var ->
+        unless is_map(input_sharding) do
+          raise ArgumentError,
+                "expected input sharding to be a map, got: #{inspect(input_sharding)}"
+        end
+
+        {_var, reverse_leaf_results} =
+          Nx.Defn.Composite.traverse(var, [], fn tensor, acc ->
+            leaf_result =
+              validate_and_convert_tensor_sharding!(mesh, all_axes, input_sharding, tensor)
+
+            {tensor, [leaf_result | acc]}
+          end)
+
+        Enum.reverse(reverse_leaf_results)
+      end)
+
+    # Separate the list format (one entry per leaf, flattened in the same order
+    # backends flatten `vars` into individual arguments) from the multipliers
+    # (for shape calculation), which stay grouped per argument so
+    # `calculate_unsharded_inputs/2` can rebuild each argument's container shape.
+    list_format = per_var_results |> Enum.flat_map(& &1) |> Enum.map(&elem(&1, 0))
+
+    multipliers =
+      Enum.map(per_var_results, fn leaf_results -> Enum.map(leaf_results, &elem(&1, 1)) end)
+
+    {list_format, multipliers}
+  end
+
+  defp validate_and_convert_tensor_sharding!(mesh, all_axes, input_sharding, tensor) do
+    # Convert map format to list format
+    # Map: %{tensor_dim => [mesh_axes]}
+    # List: [[mesh_axes], [mesh_axes], ...]
+    tensor_rank = tuple_size(tensor.shape)
+
+    # Build a mapping from dimension indices to mesh axes
+    dim_to_axes_map =
+      Enum.reduce(input_sharding, %{}, fn {tensor_dim, mesh_axes}, acc ->
+        # Normalize tensor dimension (could be integer, negative integer, or atom name)
+        dim_index = Nx.axis_index(tensor, tensor_dim)
+
+        # Check for duplicate dimension specifications
+        if Map.has_key?(acc, dim_index) do
+          raise ArgumentError,
+                "tensor dimension #{inspect(tensor_dim)} (index #{dim_index}) was specified multiple times"
+        end
+
+        Map.put(acc, dim_index, mesh_axes)
+      end)
+
+    # Convert to list format (one entry per tensor dimension)
+    dim_shardings_list =
+      for dim_idx <- 0..(tensor_rank - 1)//1 do
+        Map.get(dim_to_axes_map, dim_idx, [])
+      end
+
+    # Track which axes have been used for this specific tensor
+    {dim_shardings, _used_axes} =
+      Enum.map_reduce(dim_shardings_list, MapSet.new(), fn axis_list, used_axes ->
+        # For each dimension, check that axes are valid and not reused
+        Enum.each(axis_list, fn axis ->
+          if axis not in all_axes do
+            raise ArgumentError,
+                  "axis #{axis} is not valid for mesh with #{MapSet.size(all_axes)} axes"
+          end
+
+          if axis in used_axes do
+            raise ArgumentError, "axis #{axis} was used twice in the same input sharding"
+          end
+        end)
+
+        # Mark these axes as used
+        new_used_axes = Enum.reduce(axis_list, used_axes, &MapSet.put(&2, &1))
+
+        accumulated_dim_shardings =
+          Enum.reduce(axis_list, 1, fn axis, acc ->
+            acc * elem(mesh.shape, axis)
+          end)
+
+        {accumulated_dim_shardings, new_used_axes}
+      end)
+
+    {dim_shardings_list, dim_shardings}
+  end
+
+  defp calculate_unsharded_inputs(vars, input_shardings) do
+    # We use only the first input list in the collection,
+    # and we just assume they all have the same deep shapes.
+    #
+    # `input_shardings` holds one multiplier list per leaf tensor found in the
+    # matching `var` (a var may be a container wrapping several tensors), so we
+    # consume one multiplier list per leaf as we traverse it.
+
+    Enum.zip_with(vars, input_shardings, fn var, leaf_multipliers ->
+      {var, []} =
+        Nx.Defn.Composite.traverse(var, leaf_multipliers, fn
+          %Nx.Tensor{shape: shape} = t, [multiplier | rest] ->
+            # TODO: we need to decide how vectorization interacts with input shardings
+            updated_shape =
+              shape |> Tuple.to_list() |> Enum.zip_with(multiplier, &*/2) |> List.to_tuple()
+
+            {%{t | shape: updated_shape}, rest}
+
+          leaf, [_multiplier | rest] ->
+            {leaf, rest}
+        end)
+
+      var
+    end)
+  end
+
+  @doc false
+  def to_lazy_params(fun, args) do
+    {params, cache, {templates, funs, _}} =
+      Enum.reduce(args, {[], [], {[], [], 0}}, fn
+        arg, {params, cache, acc}
+        when is_list(arg)
+        when is_function(arg)
+        when is_tuple(arg) and is_function(elem(arg, 0)) ->
+          {params, [arg | cache], acc}
+
+        container, {params, cache, acc} ->
+          {param, acc} =
+            Nx.LazyContainer.traverse(container, acc, fn
+              template, fun, {acc_templates, acc_funs, i} ->
+                acc = {[template | acc_templates], [fun | acc_funs], i + 1}
+                {Nx.Defn.Expr.parameter(template, :root, i), acc}
+            end)
+
+          {[param | params], [nil | cache], acc}
+      end)
+
+    if Enum.all?(cache, &is_nil/1) do
+      {fun, Enum.reverse(params), Enum.reverse(templates), Enum.reverse(funs)}
+    else
+      cache = Enum.reverse(cache)
+      fun = fun(length(params), &apply(fun, merge_cache(cache, &1)))
+      {fun, Enum.reverse(params), Enum.reverse(templates), Enum.reverse(funs)}
+    end
+  end
+
+  defp merge_cache([nil | cache], [head | tail]), do: [head | merge_cache(cache, tail)]
+  defp merge_cache([head | tail], params), do: [head | merge_cache(tail, params)]
+  defp merge_cache([], []), do: []
+
   ## Helpers
 
   defp maybe_meta({_, meta, _}), do: meta
@@ -545,6 +1073,13 @@ defmodule Nx.Defn.Compiler do
   defp compile_error!(meta, state, description) do
     line = meta[:line] || state.line
     raise CompileError, line: line, file: state.file, description: description
+  end
+
+  defp warn(meta, state, message) do
+    line = meta[:line] || state.line
+    {name, arity} = state.function
+    entry = {state.module, name, arity, [file: String.to_charlist(state.file), line: line]}
+    IO.warn(message, [entry])
   end
 
   defp defn_name(name), do: :"__defn:#{name}__"

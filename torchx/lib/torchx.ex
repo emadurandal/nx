@@ -43,7 +43,8 @@ defmodule Torchx.Macro do
   @doc """
   Generates a call that returns a tensor (or a tuple/list of tensors).
 
-  All tensor variables must start with the name tensor.
+  All tensor variables must start with the name tensor. Arguments
+  may have default values, as in `donate \\\\ false`.
   """
   defmacro deftensor(call) do
     defcall(call, :unwrap_tensor!, [Macro.var(:device, __MODULE__)])
@@ -59,7 +60,11 @@ defmodule Torchx.Macro do
   end
 
   defp defcall(call, unwrapper, extra) do
-    {name, args} = Macro.decompose_call(call)
+    {name, args_with_defaults} = Macro.decompose_call(call)
+
+    # Arguments may have defaults, as in `donate \\ false`. The NIF always
+    # receives every argument.
+    args = Enum.map(args_with_defaults, &strip_default/1)
     tensors = tensors(args)
 
     if tensors == [] do
@@ -68,7 +73,7 @@ defmodule Torchx.Macro do
 
     quote do
       @torch_function {unquote(name), unquote(length(args))}
-      def unquote(name)(unquote_splicing(args)) do
+      def unquote(name)(unquote_splicing(args_with_defaults)) do
         {unquote(tensors), device} = prepare_tensors!(unquote(tensors))
 
         case device do
@@ -80,6 +85,9 @@ defmodule Torchx.Macro do
     end
   end
 
+  defp strip_default({:\\, _, [arg, _default]}), do: arg
+  defp strip_default(arg), do: arg
+
   defp has_device?(args) do
     Enum.any?(args, &match?({:device, _, nil}, &1))
   end
@@ -90,12 +98,83 @@ defmodule Torchx.Macro do
 end
 
 defmodule Torchx do
-  # TODO: Add moduledoc that documents the types and devices.
-  # Make it clear they are Torchx specific and that Torchx.Backend
-  # provides the mapping between Nx to the underlying Torchx types.
+  @valid_devices_md_list """
+    * `:cpu`
+    * `:cuda`
+    * `:mkldnn`
+    * `:opengl`
+    * `:opencl`
+    * `:ideep`
+    * `:hip`
+    * `:fpga`
+    * `:msnpu`
+    * `:xla`
+    * `:vulkan`
+    * `:metal`
+    * `:xpu`
+    * `:mps`
+  """
 
-  # TODO: Automatically download libtorch like we do for esbuild/xla.
+  @moduledoc """
+  Bindings and Nx integration for [PyTorch](https://pytorch.org/).
 
+  Torchx provides an Nx backend through `Torchx.Backend`, which
+  allows for integration with both the CPU and GPU functionality
+  that PyTorch provides. To enable Torchx as the default backend
+  you can add the following line to your desired config environment (`config/config.exs`,
+  `config/test.exs`, etc):
+
+      import Config
+      config :nx, :default_backend, Torchx.Backend
+
+  This will ensure that by default all tensors are created PyTorch tensors.
+  It's important to keep in mind that the default device is the CPU. If you
+  wish to allocated tensors to the GPU by default, you can pass the `:device`
+  option to the config line, as follows:
+
+      import Config
+      config :nx, :default_backend, {Torchx.Backend, device: :cuda}
+
+  The `device_available?/1` function can be used to determine whether
+  `:cuda` is available. If you have CUDA installed but it doesn't show
+  as available, check out the _Installation_ README section.
+
+  ## Types
+
+  Torchx implements specific names for PyTorch types, which have Nx
+  counterparts as in the following table:
+
+    Nx Type    |  Torchx Type    | Description
+   ----------- | --------------- | --------------------------------------------------------
+   `{:u, 8}`   | `:byte`           | Unsigned 8-bit integer
+   `{:s, 8}`   | `:char`           | Signed 8-bit integer
+   `{:s, 16}`  | `:short`          | Signed 16-bit integer
+   `{:s, 32}`  | `:int`            | Signed 32-bit integer
+   `{:s, 64}`  | `:long`           | Signed 64-bit integer
+   `{:bf, 16}` | `:brain`          | 16-bit brain floating-point number
+   `{:f, 8}`   | `:float8_e5m2`    | 8-bit floating-point number (E5M2)
+   `{:f8_e4m3fn, 8}` | `:float8_e4m3fn` | 8-bit floating-point number (E4M3FN)
+   `{:f, 16}`  | `:half`           | 16-bit floating-point number
+   `{:f, 32}`  | `:float`          | 32-bit floating-point number
+   `{:f, 64}`  | `:double`         | 64-bit floating-point number
+   `{:c, 64}`  | `:complex`        | 64-bit complex number, with two 32-bit float components
+   `{:c, 128}` | `:complex_double` | 128-bit complex number, with two 64-bit float components
+
+  ## Devices
+
+  PyTorch implements a variety of devices, which can be seen below.
+
+  #{@valid_devices_md_list}
+
+  ## Backend documentation
+
+  Backend-specific behaviour, options, and limitations for Nx linear algebra are
+  documented in [Nx.LinAlg](backend_documentation-nx_lin_alg.html). Top-level
+  `Nx` blocks and transfers are documented in
+  [Nx](backend_documentation-nx.html). See the
+  [backend documentation convention](https://hexdocs.pm/nx/backend_documentation-convention.html)
+  in the Nx package.
+  """
   use Torchx.Macro
   alias Torchx.NIF
 
@@ -103,33 +182,53 @@ defmodule Torchx do
 
   @doc """
   Check if device of the given type is available for Torchx.
-  Device atom can be any of:
 
-    * :cpu
-    * :cuda
-    * :mkldnn
-    * :opengl
-    * :opencl
-    * :ideep
-    * :hip
-    * :fpga
-    * :msnpu
-    * :xla
-    * :vulkan
-    * :metal
-    * :xpu
+  You can currently check the availability of:
 
-  But only :cuda availability check is supported for now.
+  * `:cuda`
+  * `:mps`
+  * `:cpu`
+
   """
   def device_available?(:cuda), do: NIF.cuda_is_available()
+  def device_available?(:mps), do: NIF.mps_is_available()
   def device_available?(:cpu), do: true
-  def device_available?(_), do: raise("Only CUDA device availability check is supported for now.")
+
+  def device_available?(device),
+    do: raise(ArgumentError, "Cannot check availability for device #{inspect(device)}.")
 
   @doc """
-  Return devices quantity for the given device type. Only :cuda is supported for now.
+  Return devices quantity for the given device type.
+
+  You can check the device count of `:cuda` for now.
   """
   def device_count(:cuda), do: NIF.cuda_device_count()
-  def device_count(_), do: raise("Only CUDA devices can be counted for now.")
+  def device_count(_), do: raise(ArgumentError, "Only CUDA devices can be counted for now.")
+
+  @doc """
+  Returns the default device.
+
+  Here is the priority in the order of availability:
+
+  * `:cuda`
+  * `:cpu`
+
+  The default can also be set (albeit not recommended)
+  via the application environment by setting the
+  `:default_device` option under the `:torchx` application.
+  """
+  @default_devices [:cuda]
+  def default_device do
+    case Application.fetch_env(:torchx, :default_device) do
+      {:ok, device} ->
+        device
+
+      :error ->
+        device = Enum.find(@default_devices, {:cpu, -1}, &device_available?/1)
+        Application.put_env(:torchx, :default_device, device)
+        device
+    end
+  end
 
   # LibTorch API bindings
 
@@ -144,48 +243,85 @@ defmodule Torchx do
   defdevice full(shape, scalar, type, device)
   defdevice scalar_tensor(scalar, type, device)
   defdevice ones(shape, type, device)
-  defdevice eye(size, type, device)
+  def eye(size, type, device), do: eye(size, size, type, device)
+  defdevice eye(m, n, type, device)
   defdevice from_blob(blob, shape, type, device)
-  defdevice to_device(tensor, device)
+  defdevice from_pointer(mode, handle, shape, type, device)
+
+  @torch_function {:to_device, 2}
+  def to_device(tensor, device) do
+    {[tensor_ref], _current_device} = prepare_tensors!([tensor])
+    {user_device, index} = normalize_device!(device)
+    target_device_struct = torch_device!(user_device, index)
+
+    case user_device do
+      :cpu -> Torchx.NIF.to_device_cpu(tensor_ref, target_device_struct)
+      _ -> Torchx.NIF.to_device_io(tensor_ref, target_device_struct)
+    end
+    |> unwrap_tensor!(user_device)
+  end
 
   ## Manipulation
 
-  deftensor reshape(tensor, shape)
-  deftensor to_type(tensor, type)
+  # The ops below take a trailing `donate` flag. When it is true and no other
+  # tensor shares the buffer of the input, the op reuses that buffer and the
+  # input can no longer be used. Otherwise it allocates as usual.
+
+  deftensor reshape(tensor, shape, donate \\ false)
+  deftensor to_type(tensor, type, donate \\ false)
   deftensor squeeze(tensor)
-  deftensor squeeze(tensor, axis)
-  deftensor broadcast_to(tensor, shape)
-  deftensor transpose(tensor, dim0, dim1)
-  deftensor permute(tensor, dims)
+  deftensor squeeze(tensor, axis, donate \\ false)
+
+  deftensor broadcast_to(tensor, shape, clone \\ nil, donate \\ false)
+  deftensor transpose(tensor, dim0, dim1, donate \\ false)
+  deftensor permute(tensor, dims, donate \\ false)
   deftensor split(tensor, split_size)
-  deftensor narrow(tensor, dim, start, length)
-  deftensor as_strided(tensor, size, strides, offset)
+  deftensor slice(tensor, starts, lengths, strides, donate \\ false)
   deftensor concatenate(tensors, axis)
   deftensor gather(tensor_input, tensor_indices, axis)
-  deftensor argsort(tensor, axis, is_descending)
+  deftensor index(tensor_input, tensor_indices)
+
+  deftensor index_put(tensor_input, tensor_indices, tensor_updates, accumulate, donate \\ false)
+  deftensor argsort(tensor, axis, is_descending, stable)
+  deftensor flip(tensor, axis)
+  deftensor unfold(tensor, dimension, size, step, donate \\ false)
+  deftensor put(tensor_input, index, tensor_source, donate \\ false)
+  deftensor where(tensorA, tensorB, tensorC)
 
   ## Aggregation
 
   deftensor sum(tensor, axes, keep_axes)
+  deftensor product(tensor)
+  deftensor product(tensor, axes, keep_axes)
+  deftensor any(tensor)
+  deftensor any(tensor, axes, keep_axes)
   deftensor argmax(tensor, axis, keep_axes)
   deftensor argmin(tensor, axis, keep_axes)
+  deftensor all(tensor)
   deftensor all(tensor, axes, keep_axes)
+  deftensor all_close(tensor_a, tensor_b, rtol, atol, equal_nan)
+
+  deftensor cumulative_sum(tensor, axis)
+  deftensor cumulative_product(tensor, axis)
+  deftensor cumulative_min(tensor, axis)
+  deftensor cumulative_max(tensor, axis)
 
   ## Binary ops
 
-  deftensor add(tensorA, tensorB)
-  deftensor subtract(tensorA, tensorB)
-  deftensor multiply(tensorA, tensorB)
-  deftensor power(tensorA, tensorB)
-  deftensor remainder(tensorA, tensorB)
-  deftensor divide(tensorA, tensorB)
-  deftensor atan2(tensorA, tensorB)
-  deftensor min(tensorA, tensorB)
-  deftensor max(tensorA, tensorB)
-  deftensor quotient(tensorA, tensorB)
+  deftensor add(tensorA, tensorB, donate \\ false)
+  deftensor subtract(tensorA, tensorB, donate \\ false)
+  deftensor multiply(tensorA, tensorB, donate \\ false)
+  deftensor pow(tensorA, tensorB, donate \\ false)
+  deftensor remainder(tensorA, tensorB, donate \\ false)
+  deftensor fmod(tensorA, tensorB, donate \\ false)
+  deftensor divide(tensorA, tensorB, donate \\ false)
+  deftensor atan2(tensorA, tensorB, donate \\ false)
+  deftensor min(tensorA, tensorB, donate \\ false)
+  deftensor max(tensorA, tensorB, donate \\ false)
+  deftensor quotient(tensorA, tensorB, donate \\ false)
 
-  deftensor left_shift(tensorA, tensorB)
-  deftensor right_shift(tensorA, tensorB)
+  deftensor left_shift(tensorA, tensorB, donate \\ false)
+  deftensor right_shift(tensorA, tensorB, donate \\ false)
 
   deftensor equal(tensorA, tensorB)
   deftensor not_equal(tensorA, tensorB)
@@ -197,54 +333,86 @@ defmodule Torchx do
   deftensor logical_and(tensorA, tensorB)
   deftensor logical_or(tensorA, tensorB)
   deftensor logical_xor(tensorA, tensorB)
+  deftensor logical_not(tensorA)
 
-  deftensor bitwise_and(tensorA, tensorB)
-  deftensor bitwise_or(tensorA, tensorB)
-  deftensor bitwise_xor(tensorA, tensorB)
+  deftensor bitwise_and(tensorA, tensorB, donate \\ false)
+  deftensor bitwise_or(tensorA, tensorB, donate \\ false)
+  deftensor bitwise_xor(tensorA, tensorB, donate \\ false)
 
-  deftensor outer(tensorA, tensorB)
-  deftensor tensordot(tensorA, tensorB, axesA, axesB)
+  deftensor amax(tensor, axes, keep_axes)
+  deftensor amin(tensor, axes, keep_axes)
+
+  def tensordot(tensorA, tensorB, axesA, axesB),
+    do: tensordot(tensorA, tensorB, axesA, [], axesB, [])
+
+  deftensor tensordot(tensorA, tensorB, axesA, batchA, axesB, batchB)
   deftensor matmul(tensorA, tensorB)
 
   ## Unary ops
 
-  deftensor exp(tensor)
-  deftensor expm1(tensor)
-  deftensor log(tensor)
-  deftensor log1p(tensor)
-  deftensor logistic(tensor)
-  deftensor cos(tensor)
-  deftensor sin(tensor)
-  deftensor tan(tensor)
-  deftensor cosh(tensor)
-  deftensor sinh(tensor)
-  deftensor tanh(tensor)
-  deftensor acos(tensor)
-  deftensor asin(tensor)
-  deftensor atan(tensor)
-  deftensor acosh(tensor)
-  deftensor asinh(tensor)
-  deftensor atanh(tensor)
-  deftensor sqrt(tensor)
-  deftensor rsqrt(tensor)
-  deftensor erf(tensor)
-  deftensor erfc(tensor)
-  deftensor erf_inv(tensor)
+  deftensor exp(tensor, donate \\ false)
+  deftensor expm1(tensor, donate \\ false)
+  deftensor log(tensor, donate \\ false)
+  deftensor log1p(tensor, donate \\ false)
+  deftensor sigmoid(tensor, donate \\ false)
+  deftensor view_as_real(tensor, donate \\ false)
+  deftensor conjugate(tensor, donate \\ false)
+  deftensor cos(tensor, donate \\ false)
+  deftensor sin(tensor, donate \\ false)
+  deftensor tan(tensor, donate \\ false)
+  deftensor cosh(tensor, donate \\ false)
+  deftensor sinh(tensor, donate \\ false)
+  deftensor tanh(tensor, donate \\ false)
+  deftensor acos(tensor, donate \\ false)
+  deftensor asin(tensor, donate \\ false)
+  deftensor atan(tensor, donate \\ false)
+  deftensor acosh(tensor, donate \\ false)
+  deftensor asinh(tensor, donate \\ false)
+  deftensor atanh(tensor, donate \\ false)
+  deftensor sqrt(tensor, donate \\ false)
+  deftensor rsqrt(tensor, donate \\ false)
+  deftensor erf(tensor, donate \\ false)
+  deftensor erfc(tensor, donate \\ false)
+  deftensor erf_inv(tensor, donate \\ false)
+  deftensor cbrt(tensor)
+  deftensor fft(tensor, length, axis)
+  deftensor ifft(tensor, length, axis)
+  deftensor rfft(tensor, length, axis)
+  deftensor irfft(tensor, length, axis)
+  deftensor fft2(tensor, lengths, axes)
+  deftensor ifft2(tensor, lengths, axes)
 
-  deftensor abs(tensor)
-  deftensor bitwise_not(tensor)
-  deftensor ceil(tensor)
-  deftensor floor(tensor)
-  deftensor negate(tensor)
-  deftensor round(tensor)
-  deftensor sign(tensor)
+  deftensor abs(tensor, donate \\ false)
+  deftensor bitwise_not(tensor, donate \\ false)
+  deftensor ceil(tensor, donate \\ false)
+  deftensor floor(tensor, donate \\ false)
+  deftensor negate(tensor, donate \\ false)
+  deftensor round(tensor, donate \\ false)
+  deftensor sign(tensor, donate \\ false)
+  deftensor is_nan(tensor)
+  deftensor is_infinity(tensor)
+
+  deftensor pad(tensor, tensor_scalar, config)
 
   ## LinAlg
 
   deftensor cholesky(tensor)
   deftensor cholesky(tensor, upper)
+  deftensor eigh(tensor)
   deftensor qr(tensor)
   deftensor qr(tensor, reduced)
+  deftensor svd(tensor)
+  deftensor svd(tensor, full_matrices)
+  deftensor lu(tensor)
+  deftensor triangular_solve(tensor_a, tensor_b, transpose, upper)
+  deftensor determinant(tensor)
+  deftensor sort(tensor, axis, descending, stable)
+  deftensor top_k(tensor, k)
+  deftensor clip(tensor, tensor_min, tensor_max)
+  deftensor solve(tensor_a, tensor_b)
+
+  deftensor conv(tensor_input, tensor_kernel, strides, padding, dilation, transposed, groups)
+  deftensor max_pool_3d(tensor_input, kernel_size, strides, padding, dilation)
 
   ## Dirty non-tensor return values
 
@@ -258,6 +426,12 @@ defmodule Torchx do
   def scalar_type({dev, ref}) when is_tensor(dev, ref), do: NIF.scalar_type(ref) |> unwrap!()
   def shape({dev, ref}) when is_tensor(dev, ref), do: NIF.shape(ref) |> unwrap!()
   def nbytes({dev, ref}) when is_tensor(dev, ref), do: NIF.nbytes(ref) |> unwrap!()
+
+  @doc false
+  def to_pointer({dev, ref}, mode, permissions)
+      when is_tensor(dev, ref) and is_atom(mode) and is_integer(permissions) do
+    NIF.to_pointer(ref, mode, permissions) |> unwrap!()
+  end
 
   ## Nx
 
@@ -295,7 +469,8 @@ defmodule Torchx do
     xla: 9,
     vulkan: 10,
     metal: 11,
-    xpu: 12
+    xpu: 12,
+    mps: 13
   }
 
   defp normalize_device!({device, index}) when is_atom(device) and is_integer(index),
@@ -312,6 +487,7 @@ defmodule Torchx do
     {id, index}
   end
 
+  defp unwrap!(:ok), do: :ok
   defp unwrap!({:ok, result}), do: result
   defp unwrap!({:error, error}), do: raise("Torchx: " <> List.to_string(error))
 
@@ -335,7 +511,9 @@ defmodule Torchx do
           ref
 
         {other_dev, ref} when is_tensor(other_dev, ref) ->
-          raise ArgumentError, "cannot perform operation across devices #{dev} and #{other_dev}"
+          # Auto-transfer tensor to target device
+          {^dev, new_ref} = Torchx.to_device({other_dev, ref}, dev)
+          new_ref
 
         bad_tensor ->
           raise ArgumentError, "expected a Torchx tensor, got: #{inspect(bad_tensor)}"
@@ -353,7 +531,9 @@ defmodule Torchx do
         {ref, dev}
 
       {dev, ref}, other_dev when is_tensor(dev, ref) ->
-        raise ArgumentError, "cannot perform operation across devices #{dev} and #{other_dev}"
+        # Auto-transfer tensor to target device
+        {^other_dev, new_ref} = Torchx.to_device({dev, ref}, other_dev)
+        {new_ref, other_dev}
 
       [{dev, ref} | _] = tensors, nil when is_tensor(dev, ref) ->
         prepare_tensors_list!(tensors, dev)

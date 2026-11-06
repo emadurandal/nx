@@ -10,11 +10,19 @@ defmodule EXLA.Application do
       _ -> :os.set_signal(:sigchld, :default)
     end
 
+    pool_size = System.schedulers_online()
+
     children = [
-      {Registry, name: EXLA.Registry, keys: :unique},
+      EXLA.Logger,
+      {NimblePool,
+       worker: {EXLA.MLIR.ContextPool, %{pool_size: pool_size}},
+       pool_size: pool_size,
+       name: EXLA.MLIR.ContextPool,
+       lazy: true},
       EXLA.Client,
-      EXLA.LockedCache,
-      EXLA.Logger
+      EXLA.Defn.Lock,
+      EXLA.Defn.LockedCache,
+      {Task.Supervisor, name: EXLA.Defn.TaskSupervisor}
     ]
 
     Supervisor.start_link(children, name: __MODULE__, strategy: :one_for_one)

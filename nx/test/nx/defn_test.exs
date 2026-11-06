@@ -2,32 +2,129 @@ defmodule Nx.DefnTest do
   use ExUnit.Case, async: true
 
   alias Nx.Tensor, as: T
-  alias Nx.Defn.{Expr, Identity, Evaluator}
+  alias Nx.Defn.{Expr, Debug, Evaluator}
   alias Nx.DefnTest.Sample
-
   import Nx.Defn
-  doctest Nx.Defn
+  import Nx.Testing
 
   defmacrop location(plus) do
     file = Path.relative_to_cwd(__CALLER__.file)
     quote do: "#{unquote(file)}:#{unquote(__CALLER__.line) + unquote(plus)}"
   end
 
-  @default_defn_compiler Identity
+  setup context do
+    Nx.Defn.default_options(compiler: context[:compiler] || Debug)
+    :ok
+  end
+
+  describe "doctest" do
+    @describetag compiler: Evaluator
+    doctest Nx.Defn
+  end
 
   describe "constants" do
     @tensor [1, 2, 3]
-    defn list_constant, do: Nx.tensor(@tensor)
+    defn(list_constant, do: Nx.tensor(@tensor))
+
+    defn complex_constant do
+      Complex.new(1, :infinity)
+    end
 
     test "from list" do
       assert %T{data: %Expr{op: :tensor}} = list_constant()
     end
 
     @tensor Nx.to_binary(Nx.tensor([1, 2, 3]))
-    defn binary_constant, do: Nx.from_binary(@tensor, {:s, 64})
+    defn(binary_constant, do: Nx.from_binary(@tensor, {:s, 32}))
 
     test "from binary" do
       assert %T{data: %Expr{op: :tensor}} = binary_constant()
+    end
+
+    test "complex literals" do
+      assert %T{data: %Expr{op: :constant, args: [%Complex{} = c]}} = complex_constant()
+      assert c == Complex.new(1, :infinity)
+    end
+
+    defn real_constants_as_arbitrary_precision(x) do
+      cond do
+        x == 0 -> Nx.Constants.e()
+        x == 1 -> Nx.Constants.pi()
+        true -> x
+      end
+    end
+
+    defn imaginary_constant_as_arbitrary_precision(x) do
+      x * Nx.Constants.i()
+    end
+
+    test "Defines real constants as numerical when used with arity 0 inside defn" do
+      for input_type <- [f: 8, f: 16, f: 32, f: 64] do
+        assert %T{
+                 type: ^input_type,
+                 data: %Expr{op: :cond, args: [[clause1, clause2], _last]}
+               } =
+                 real_constants_as_arbitrary_precision(Nx.tensor(10.0, type: input_type))
+
+        e = :math.exp(1)
+        pi = :math.pi()
+        assert {_, %T{type: ^input_type, data: %Expr{op: :constant, args: [^e]}}} = clause1
+        assert {_, %T{type: ^input_type, data: %Expr{op: :constant, args: [^pi]}}} = clause2
+      end
+
+      for input_type <- [c: 64, c: 128] do
+        assert %T{
+                 type: ^input_type,
+                 data: %Expr{op: :cond, args: [[clause1, clause2], _last]}
+               } =
+                 real_constants_as_arbitrary_precision(Nx.tensor(10.0, type: input_type))
+
+        e = Complex.new(:math.exp(1))
+        pi = Complex.new(:math.pi())
+        assert {_, %T{type: ^input_type, data: %Expr{op: :constant, args: [^e]}}} = clause1
+        assert {_, %T{type: ^input_type, data: %Expr{op: :constant, args: [^pi]}}} = clause2
+      end
+    end
+
+    test "Defines imaginary constant as Complex.new(0, 1) when used with arity 0 inside defn" do
+      for input_type <- [f: 8, f: 16, f: 32, f: 64, c: 64, c: 128] do
+        type =
+          case input_type do
+            {:f, 64} -> {:c, 128}
+            {:c, 128} -> {:c, 128}
+            _ -> {:c, 64}
+          end
+
+        # note: we expect the number to be shifted to the left
+        # because after AST normalization, but before Expr parsing,
+        # Nx.Constants.i() is converted to Complex.new(0, 1), which is
+        # a literal number.
+        assert %T{
+                 type: ^type,
+                 data: %Expr{op: :multiply, args: [arg0, arg1]}
+               } =
+                 imaginary_constant_as_arbitrary_precision(Nx.tensor(10.0, type: input_type))
+
+        i = Complex.new(0, 1)
+        %T{data: %Expr{op: :constant, args: [^i]}} = arg0
+        %T{data: %Expr{op: :parameter, args: [0]}} = arg1
+      end
+    end
+  end
+
+  describe "Nx.tensor" do
+    test "does not warn on negative values" do
+      defmodule NegConstant do
+        defn(this_wont_warn, do: Nx.tensor(1) + Nx.tensor(-1))
+      end
+    end
+
+    test "warns if not constant" do
+      assert ExUnit.CaptureIO.capture_io(:stderr, fn ->
+               defmodule NotConstant do
+                 defn(not_constant(opts), do: Nx.tensor(opts[:rate]))
+               end
+             end) =~ "Nx.tensor/2 inside defn expects the first argument to be a literal"
     end
   end
 
@@ -40,7 +137,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                tuple_shape_match_signature({1, 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -53,7 +150,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                tuple_shape_match_alias({1, 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -66,8 +163,17 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                tuple_shape_match_inside_body({1, 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
+    end
+
+    defn nested_tuple_shape_match_signature({a, {b, c}}) do
+      a + b + c
+    end
+
+    test "allows nested pattern matching on the tuple shape on signature" do
+      assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [_, _]}} =
+               nested_tuple_shape_match_signature({1, {2.0, 3.0}})
     end
   end
 
@@ -80,7 +186,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                map_shape_match_signature(%{a: 1, b: 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -93,7 +199,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                map_shape_match_alias(%{a: 1, b: 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -106,7 +212,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                map_shape_match_inside_body(%{a: 1, b: 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -118,7 +224,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                map_shape_access(%{a: 1, b: 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -130,7 +236,7 @@ defmodule Nx.DefnTest do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                map_shape_dot(%{a: 1, b: 2.0})
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
@@ -156,18 +262,18 @@ defmodule Nx.DefnTest do
 
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [^a, b]}} = add
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = a
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = a
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = b
     end
 
-    defn verify_maps(map) do
-      transform(map, fn map ->
-        for {k, v} <- map do
-          assert Elixir.Kernel.==(v.shape, {String.to_integer(k)})
-        end
+    defn(verify_maps(map), do: verify_maps_transform(map))
 
-        map
-      end)
+    deftransformp verify_maps_transform(map) do
+      for {k, v} <- map do
+        assert Elixir.Kernel.==(v.shape, {String.to_integer(k)})
+      end
+
+      map
     end
 
     test "keeps map ordering across different sizes" do
@@ -182,145 +288,61 @@ defmodule Nx.DefnTest do
     end
   end
 
-  describe "structs" do
-    defmodule StructTest do
-      import Nx.Defn
-      alias __MODULE__, as: S
-
-      defstruct [:a, :b]
-
-      @default_defn_compiler Identity
-
-      defn struct_match_signature(%S{a: a, b: b}) do
-        a + b
-      end
-
-      defn struct_match_alias(%S{} = var) do
-        %S{a: a, b: b} = var
-        a + b
-      end
-
-      defn struct_match_in_body(var) do
-        %S{a: a, b: b} = var
-        a + b
-      end
-
-      defn struct_dot(var) do
-        var.a + var.b
-      end
-
-      defn return_struct(x, y) do
-        %S{a: x + y, b: x - y}
-      end
-
-      defn struct_update_struct(var, x) do
-        %S{var | b: x}
-      end
-
-      defn struct_update_map(var, x) do
-        %{var | b: x}
-      end
-    end
-
-    test "struct can match in signature" do
-      inp = %StructTest{a: Nx.tensor(1), b: Nx.tensor(2)}
-
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :add, args: [left, right]}} =
-               StructTest.struct_match_signature(inp)
-
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
-      assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:s, 64}} = right
-    end
-
-    test "struct can match alias" do
-      inp = %StructTest{a: 1, b: 2}
-
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :add, args: [left, right]}} =
-               StructTest.struct_match_alias(inp)
-
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
-      assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:s, 64}} = right
-    end
-
-    test "struct can match in body" do
-      inp = %StructTest{a: 1, b: 2}
-
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :add, args: [left, right]}} =
-               StructTest.struct_match_in_body(inp)
-
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
-      assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:s, 64}} = right
-    end
-
-    test "struct can use dot" do
-      inp = %StructTest{a: 1, b: 2}
-
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :add, args: [left, right]}} =
-               StructTest.struct_dot(inp)
-
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
-      assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:s, 64}} = right
-    end
-
-    test "struct can be returned" do
-      assert %StructTest{a: a, b: b} = StructTest.return_struct(1, 2.0)
-
-      assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} = a
-
-      assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :subtract, args: [^left, ^right]}} = b
-    end
-
-    test "struct can be updated" do
-      inp = %StructTest{a: 1, b: 2.0}
-
-      assert %StructTest{a: a, b: b} = StructTest.struct_update_struct(inp, 8)
-
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :parameter, args: [0]}} = a
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :parameter, args: [2]}} = b
-
-      assert %StructTest{a: a, b: b} = StructTest.struct_update_map(inp, 8)
-
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :parameter, args: [0]}} = a
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :parameter, args: [2]}} = b
-    end
-  end
-
   describe "anonymous functions args" do
-    defn calls_binary_fun(fun, a, b), do: fun.(a, b)
+    defn(calls_binary_fun(fun, a, b), do: fun.(a, b))
 
     test "calls anonymous function directly" do
       assert %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} =
                calls_binary_fun(&Nx.add/2, 1, 2.0)
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
 
-    defn calls_reduce_fun(fun, t), do: Nx.reduce(t, 0, fun)
+    defn(calls_reduce_fun(fun, t), do: Nx.reduce(t, 0, fun))
 
     test "calls anonymous function via reduce" do
-      assert %T{shape: {}, type: {:s, 64}, data: %Expr{op: :reduce}} =
+      assert %T{shape: {}, type: {:s, 32}, data: %Expr{op: :reduce}} =
                calls_reduce_fun(&Nx.add/2, Nx.tensor([1, 2, 3]))
     end
 
-    defn calls_tuple_fun({funa, funb}, a, b), do: {funa.(a, b), funb.(a, b)}
+    defn(calls_binary_funs({funa, funb}, a, b), do: {funa.(a, b), funb.(a, b)})
 
-    test "calls anonymous function from tuples" do
-      assert {%T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}},
-              %T{shape: {}, type: {:f, 32}, data: %Expr{op: :subtract, args: [left, right]}}} =
-               calls_tuple_fun({&Nx.add/2, &Nx.subtract/2}, 1, 2.0)
+    test "receives multiple anonymous functions in tuple" do
+      assert {fun_left, fun_right} = calls_binary_funs({&Nx.add/2, &Nx.subtract/2}, 1, 2.0)
 
-      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 64}} = left
+      %T{shape: {}, type: {:f, 32}, data: %Expr{op: :add, args: [left, right]}} = fun_left
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
       assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
 
-      assert_raise ArgumentError,
-                   ~r"Anonymous functions are only allowed as direct arguments to defn",
-                   fn -> calls_tuple_fun({&Nx.add/2, 0}, 1, 2.0) end
+      %T{shape: {}, type: {:f, 32}, data: %Expr{op: :subtract, args: [left, right]}} = fun_right
+      assert %T{data: %Expr{op: :parameter, args: [0]}, type: {:s, 32}} = left
+      assert %T{data: %Expr{op: :parameter, args: [1]}, type: {:f, 32}} = right
     end
   end
 
   describe "unary ops" do
-    defn exp(t), do: Nx.exp(t)
+    defn(exp(t), do: Nx.exp(t))
+
+    defn unary_plus_minus_guards(opts \\ []) do
+      case opts[:value] do
+        value when value == -2 ->
+          -1
+
+        value when value == +2 ->
+          1
+      end
+    end
+
+    defn unary_plus_minus_match(opts \\ []) do
+      case opts[:value] do
+        -2 ->
+          -1
+
+        +2 ->
+          1
+      end
+    end
 
     test "to expr" do
       assert %T{shape: {3}, type: {:f, 32}, data: %Expr{op: :exp, args: [_]}} =
@@ -332,18 +354,25 @@ defmodule Nx.DefnTest do
       assert %T{shape: {3}, type: {:bf, 16}, data: %Expr{op: :exp, args: [_]}} =
                exp(Nx.tensor([1, 2, 3], type: {:bf, 16}))
     end
+
+    test "unary + and - work with guards and hard matches" do
+      assert Expr.tensor(-1) == unary_plus_minus_guards(value: -2)
+      assert Expr.tensor(1) == unary_plus_minus_guards(value: 2)
+      assert Expr.tensor(-1) == unary_plus_minus_match(value: -2)
+      assert Expr.tensor(1) == unary_plus_minus_match(value: 2)
+    end
   end
 
   describe "binary ops" do
-    defn add(t1, t2), do: Nx.add(t1, t2)
-    defn add_two_int(t), do: Nx.add(t, 2)
-    defn add_two_float(t), do: Nx.add(t, 2)
+    defn(add(t1, t2), do: Nx.add(t1, t2))
+    defn(add_two_int(t), do: Nx.add(t, 2))
+    defn(add_two_float(t), do: Nx.add(t, 2))
 
     test "to expr" do
-      assert %T{shape: {3}, type: {:s, 64}, data: %Expr{op: :add, args: [_, _]}} =
+      assert %T{shape: {3}, type: {:s, 32}, data: %Expr{op: :add, args: [_, _]}} =
                add(Nx.tensor([1, 2, 3]), Nx.tensor(1))
 
-      assert %T{shape: {2, 2}, type: {:s, 64}, data: %Expr{op: :add, args: [_, _]}} =
+      assert %T{shape: {2, 2}, type: {:s, 32}, data: %Expr{op: :add, args: [_, _]}} =
                add(Nx.tensor([[1, 2], [3, 4]]), Nx.tensor([1, 2]))
 
       assert %T{shape: {2, 2}, type: {:f, 32}, data: %Expr{op: :add, args: [_, _]}} =
@@ -363,21 +392,21 @@ defmodule Nx.DefnTest do
   end
 
   describe "aggregate axes ops" do
-    defn sum_all(t), do: Nx.sum(t)
-    defn sum_pos(t), do: Nx.sum(t, axes: [0, 1])
-    defn sum_neg(t), do: Nx.sum(t, axes: [-1, -2])
-    defn sum_keep(t), do: Nx.sum(t, axes: [0, 1], keep_axes: true)
+    defn(sum_all(t), do: Nx.sum(t))
+    defn(sum_pos(t), do: Nx.sum(t, axes: [0, 1]))
+    defn(sum_neg(t), do: Nx.sum(t, axes: [-1, -2]))
+    defn(sum_keep(t), do: Nx.sum(t, axes: [0, 1], keep_axes: true))
 
     test "to expr" do
       assert %T{
                shape: {},
-               type: {:s, 64},
+               type: {:s, 32},
                data: %Expr{op: :sum, args: [_, [axes: nil, keep_axes: false]]}
              } = sum_all(Nx.tensor([1, 2, 3]))
 
       assert %T{
                shape: {},
-               type: {:s, 64},
+               type: {:s, 32},
                data: %Expr{op: :sum, args: [_, [axes: [0, 1], keep_axes: false]]}
              } = sum_pos(Nx.tensor([[1, 2, 3], [1, 2, 3]], type: {:s, 8}))
 
@@ -389,7 +418,7 @@ defmodule Nx.DefnTest do
 
       assert %T{
                shape: {},
-               type: {:u, 64},
+               type: {:u, 32},
                data: %Expr{op: :sum, args: [_, [axes: [1, 0], keep_axes: false]]}
              } = sum_neg(Nx.tensor([[1, 2, 3], [1, 2, 3]], type: {:u, 8}))
 
@@ -408,10 +437,8 @@ defmodule Nx.DefnTest do
   end
 
   describe "creation ops" do
-    defn iota(t), do: Nx.iota(t)
-    defn eye, do: Nx.eye(2)
-    defn random_uniform(t), do: Nx.random_uniform(t, 0.0, 2.0)
-    defn random_normal(t), do: Nx.random_normal(t, 0.0, 1.0)
+    defn(iota(t), do: Nx.iota(Nx.shape(t)))
+    defn(eye, do: Nx.eye(2))
 
     test "iota" do
       assert %T{shape: {3}, data: %Expr{op: :iota, args: [nil]}} = iota(Nx.tensor([1, 2, 3]))
@@ -421,26 +448,19 @@ defmodule Nx.DefnTest do
       assert %T{shape: {2, 2}, data: %Expr{op: :eye, args: []}} = eye()
     end
 
-    test "random uniform" do
-      assert %T{
-               shape: {3},
-               data: %Expr{op: :random_uniform, args: [%T{shape: {}}, %T{shape: {}}]}
-             } = random_uniform(Nx.tensor([1, 2, 3]))
-    end
-
-    test "random normal" do
-      assert %T{shape: {3}, data: %Expr{op: :random_normal, args: [%T{shape: {}}, %T{shape: {}}]}} =
-               random_normal(Nx.tensor([1, 2, 3]))
+    test "raise an error given a shape tuple with tensor values" do
+      assert_raise ArgumentError,
+                   ~r"invalid dimension in axis 0 found in shape.*if you are trying to pass a dimension or a shape as an argument to a defn function"s,
+                   fn -> iota({10}) end
     end
   end
 
   describe "tensor ops" do
-    defn dot2(t1, t2), do: Nx.dot(t1, t2)
-    defn dot6(t1, t2), do: Nx.dot(t1, [-2], [], t2, [-1], [])
-    defn outer(t1, t2), do: Nx.outer(t1, t2)
-    defn transpose_1(t), do: Nx.transpose(t)
-    defn transpose_2(t), do: Nx.transpose(t, axes: [-1, -2])
-    defn reshape(t), do: Nx.reshape(t, {2, 3})
+    defn(dot2(t1, t2), do: Nx.dot(t1, t2))
+    defn(dot6(t1, t2), do: Nx.dot(t1, [-2], [], t2, [-1], []))
+    defn(transpose_1(t), do: Nx.transpose(t))
+    defn(transpose_2(t), do: Nx.transpose(t, axes: [-1, -2]))
+    defn(reshape(t), do: Nx.reshape(t, {2, 3}))
 
     test "dot product" do
       assert %T{data: %Expr{op: :dot, args: [_, [0], _, _, [0], _]}, shape: {2}} =
@@ -456,11 +476,6 @@ defmodule Nx.DefnTest do
                dot6(Nx.tensor([[1, 2, 3], [1, 2, 3]]), Nx.tensor([[1, 2], [3, 4], [5, 6]]))
     end
 
-    test "outer product" do
-      assert %T{data: %Expr{op: :outer, args: [_, _]}, shape: {3, 3}} =
-               outer(Nx.tensor([1, 2, 3]), Nx.tensor([1, 2, 3]))
-    end
-
     test "transpose" do
       assert %T{data: %Expr{op: :transpose, args: [_, [1, 0]]}, shape: {3, 2}} =
                transpose_1(Nx.tensor([[1, 2, 3], [1, 2, 3]]))
@@ -470,14 +485,14 @@ defmodule Nx.DefnTest do
     end
 
     test "reshape" do
-      assert %T{data: %Expr{op: :reshape, args: [_, _]}, shape: {2, 3}} =
+      assert %T{data: %Expr{op: :reshape, args: [_]}, shape: {2, 3}} =
                reshape(Nx.tensor([[1, 2], [3, 4], [5, 6]]))
     end
   end
 
   describe "broadcast" do
-    defn broadcast(t), do: Nx.broadcast(t, {3, 3, 3})
-    defn broadcast_axes(t), do: Nx.broadcast(t, {3, 2}, axes: [-2])
+    defn(broadcast(t), do: Nx.broadcast(t, {3, 3, 3}))
+    defn(broadcast_axes(t), do: Nx.broadcast(t, {3, 2}, axes: [-2]))
 
     test "with and without axes" do
       assert %T{data: %Expr{op: :broadcast, args: [_, _, [2]]}, shape: {3, 3, 3}} =
@@ -487,27 +502,32 @@ defmodule Nx.DefnTest do
                broadcast_axes(Nx.tensor([1, 2, 3]))
     end
 
-    defn broadcast_collapse1(t),
-      do: t |> Nx.broadcast({5, 3}) |> Nx.broadcast({7, 5, 3})
+    defn(broadcast_collapse1(t), do: t |> Nx.broadcast({5, 3}) |> Nx.broadcast({7, 5, 3}))
 
-    defn broadcast_collapse2(t),
+    defn(broadcast_collapse2(t),
       do: t |> Nx.broadcast({3, 5}, axes: [0]) |> Nx.broadcast({3, 5, 7}, axes: [0, 1])
+    )
 
-    defn broadcast_collapse3(t),
+    defn(broadcast_collapse3(t),
       do: t |> Nx.broadcast({3, 5}, axes: [0]) |> Nx.broadcast({3, 7, 5}, axes: [0, 2])
+    )
 
-    defn broadcast_collapse4(t),
+    defn(broadcast_collapse4(t),
       do: t |> Nx.broadcast({3, 5}, axes: [0]) |> Nx.broadcast({7, 3, 5}, axes: [1, 2])
+    )
 
-    defn broadcast_collapse5(t),
+    defn(broadcast_collapse5(t),
       do: t |> Nx.broadcast({5, 3}) |> Nx.broadcast({7, 5, 3, 9}, axes: [1, 2])
+    )
 
-    defn broadcast_collapse6(t),
+    defn(broadcast_collapse6(t),
       do: t |> Nx.broadcast({5, 3, 7}, axes: [1]) |> Nx.broadcast({9, 5, 3, 7}, axes: [1, 2, 3])
+    )
 
-    defn broadcast_collapse7(t),
+    defn(broadcast_collapse7(t),
       do:
         t |> Nx.broadcast({3, 5, 7}, axes: [0, 2]) |> Nx.broadcast({3, 9, 5, 7}, axes: [0, 2, 3])
+    )
 
     test "collapses" do
       assert %T{data: %Expr{op: :broadcast, args: [_, {7, 5, 3}, [1]]}, shape: {7, 5, 3}} =
@@ -534,16 +554,16 @@ defmodule Nx.DefnTest do
   end
 
   describe "squeeze" do
-    defn squeeze(t), do: Nx.squeeze(t)
+    defn(squeeze(t), do: Nx.squeeze(t))
 
     test "sized one dimensions" do
       assert %T{data: %Expr{op: :squeeze, args: [_, [0, 2, 4]]}, shape: {3, 2}} =
                squeeze(Nx.iota({1, 3, 1, 2, 1}))
     end
 
-    defn squeeze_collapse1(t), do: t |> Nx.squeeze(axes: [0, 2]) |> Nx.squeeze(axes: [0, 2])
-    defn squeeze_collapse2(t), do: t |> Nx.squeeze(axes: [3, 1]) |> Nx.squeeze(axes: [2])
-    defn squeeze_collapse3(t), do: t |> Nx.squeeze(axes: [2]) |> Nx.squeeze(axes: [3, 1])
+    defn(squeeze_collapse1(t), do: t |> Nx.squeeze(axes: [0, 2]) |> Nx.squeeze(axes: [0, 2]))
+    defn(squeeze_collapse2(t), do: t |> Nx.squeeze(axes: [3, 1]) |> Nx.squeeze(axes: [2]))
+    defn(squeeze_collapse3(t), do: t |> Nx.squeeze(axes: [2]) |> Nx.squeeze(axes: [3, 1]))
 
     test "with explicit dimensions are collapsed" do
       assert %T{data: %Expr{op: :squeeze, args: [_, [0, 1, 2, 4]]}, shape: {1}, names: [:d]} =
@@ -558,7 +578,7 @@ defmodule Nx.DefnTest do
   end
 
   describe "conditional ops" do
-    defn select(t1, t2, t3), do: Nx.select(t1, t2, t3)
+    defn(select(t1, t2, t3), do: Nx.select(t1, t2, t3))
 
     test "select with tensor predicate" do
       assert %{data: %Expr{op: :select, args: [_, _, _]}, shape: {2, 2}} =
@@ -575,21 +595,22 @@ defmodule Nx.DefnTest do
   end
 
   describe "reduce ops" do
-    defn reduce(t1, acc), do: Nx.reduce(t1, acc, fn x, y -> x + y end)
+    defn(reduce(t1, acc), do: Nx.reduce(t1, acc, fn x, y -> x + y end))
 
-    defn reduce_static(t1, acc), do: Nx.reduce(t1, acc, fn _, _ -> 0 end)
+    defn(reduce_static(t1, acc), do: Nx.reduce(t1, acc, fn _, _ -> 0 end))
 
-    defn reduce_invalid(t1, amplifier), do: Nx.reduce(t1, 0, fn x, y -> x * amplifier + y end)
+    defn(reduce_invalid(t1, amplifier), do: Nx.reduce(t1, 0, fn x, y -> x * amplifier + y end))
 
-    defn reduce_non_scalar(t1), do: Nx.reduce(t1, 0, fn x, y -> Nx.broadcast(x * y, {1, 1}) end)
+    defn(reduce_non_scalar(t1), do: Nx.reduce(t1, 0, fn x, y -> Nx.broadcast(x * y, {1, 1}) end))
 
-    defn reduce_with_opts(t1, acc),
+    defn(reduce_with_opts(t1, acc),
       do: Nx.reduce(t1, acc, [type: {:f, 64}, axes: [-1]], fn x, y -> x + y end)
+    )
 
     test "reduces with function" do
       assert %{
                data: %Expr{op: :reduce, args: [_, _, [axes: nil, keep_axes: false], fun]},
-               type: {:s, 64},
+               type: {:s, 32},
                shape: {}
              } = reduce(Nx.tensor([1, 2, 3]), 0)
 
@@ -607,7 +628,7 @@ defmodule Nx.DefnTest do
     test "reduces with constant" do
       assert %{
                data: %Expr{op: :reduce, args: [_, _, [axes: nil, keep_axes: false], fun]},
-               type: {:s, 64},
+               type: {:s, 32},
                shape: {}
              } = reduce_static(Nx.tensor([1, 2, 3]), 0)
 
@@ -636,146 +657,130 @@ defmodule Nx.DefnTest do
   end
 
   describe "operators" do
-    defn add_two(a, b), do: a + b
+    defn(add_two(a, b), do: a + b)
 
     test "+" do
       assert %T{data: %Expr{op: :add, args: [_, _]}} = add_two(1, 2)
     end
 
-    defn subtract_two(a, b), do: a - b
+    defn(subtract_two(a, b), do: a - b)
 
     test "-" do
       assert %T{data: %Expr{op: :subtract, args: [_, _]}} = subtract_two(1, 2)
     end
 
-    defn multiply_two(a, b), do: a * b
+    defn(multiply_two(a, b), do: a * b)
 
     test "*" do
       assert %T{data: %Expr{op: :multiply, args: [_, _]}} = multiply_two(1, 2)
     end
 
-    defn divide_two(a, b), do: a / b
+    defn(divide_two(a, b), do: a / b)
 
     test "/" do
       assert %T{data: %Expr{op: :divide, args: [_, _]}} = divide_two(1, 2)
     end
 
-    defn land_two(a, b), do: a and b
+    defn(land_two(a, b), do: a and b)
 
     defn land_true(a) do
-      val = transform({}, fn _ -> true end)
-      val and a
+      true and a
     end
 
     test "and" do
       assert %T{data: %Expr{op: :logical_and, args: [_, _]}} = land_two(1, 2)
-
-      assert_raise ArgumentError, ~r/boolean value passed to Nx.Defn.Kernel.and\/2/, fn ->
-        land_true(2)
-      end
     end
 
-    defn lor_two(a, b), do: a or b
+    defn(lor_two(a, b), do: a or b)
 
-    defn lor_true(a) do
-      val = transform({}, fn _ -> true end)
-      val or a
+    defn lor_true(opts \\ []) do
+      true or opts[:value]
     end
 
     test "or" do
       assert %T{data: %Expr{op: :logical_or, args: [_, _]}} = lor_two(1, 2)
+    end
 
-      assert_raise ArgumentError, ~r/boolean value passed to Nx.Defn.Kernel.or\/2/, fn ->
-        lor_true(2)
+    defn(lnot(a), do: not a)
+    defn(lnot_boolean(opts \\ []), do: not constant_boolean_transform(opts))
+
+    deftransformp constant_boolean_transform(opts) do
+      if opts[:value] == true do
+        true
+      else
+        false
       end
     end
 
-    defn lnot(a), do: not a
-    defn lnot_true(), do: not transform({}, fn _ -> true end)
-
-    test "not" do
-      assert %T{data: %Expr{op: :equal, args: [_, _]}} = lnot(1)
-
-      assert_raise ArgumentError, ~r/boolean value passed to Nx.Defn.Kernel.not\/1/, fn ->
-        lnot_true()
-      end
-    end
-
-    defn band_two(a, b), do: a &&& b
+    defn(band_two(a, b), do: a &&& b)
 
     test "&&&" do
       assert %T{data: %Expr{op: :bitwise_and, args: [_, _]}} = band_two(1, 2)
     end
 
-    defn bor_two(a, b), do: a ||| b
+    defn(bor_two(a, b), do: a ||| b)
 
     test "|||" do
       assert %T{data: %Expr{op: :bitwise_or, args: [_, _]}} = bor_two(1, 2)
     end
 
-    defn bsl_two(a, b), do: a <<< b
+    defn(bsl_two(a, b), do: a <<< b)
 
     test "<<<" do
       assert %T{data: %Expr{op: :left_shift, args: [_, _]}} = bsl_two(1, 2)
     end
 
-    defn bsr_two(a, b), do: a >>> b
+    defn(bsr_two(a, b), do: a >>> b)
 
     test ">>>" do
       assert %T{data: %Expr{op: :right_shift, args: [_, _]}} = bsr_two(1, 2)
     end
 
-    defn add_two_with_pipe(a, b), do: a |> Nx.add(b)
+    defn(add_two_with_pipe(a, b), do: a |> Nx.add(b))
 
     test "|>" do
       assert %T{data: %Expr{op: :add, args: [_, _]}} = add_two_with_pipe(1, 2)
     end
 
-    defn unary_plus(a), do: +a
-    defn unary_minus(a), do: -a
+    defn(unary_plus(a), do: +a)
+    defn(unary_minus(a), do: -a)
 
     test "unary plus and minus" do
       assert %T{data: %Expr{op: :parameter, args: [_]}} = unary_plus(1)
       assert %T{data: %Expr{op: :negate, args: [_]}} = unary_minus(1)
     end
 
-    defn unary_bnot(a), do: ~~~a
-
-    test "~~~" do
-      assert %T{data: %Expr{op: :bitwise_not, args: [_]}} = unary_bnot(1)
-    end
-
-    defn equality(a, b), do: a == b
+    defn(equality(a, b), do: a == b)
 
     test "==" do
       assert %T{data: %Expr{op: :equal, args: [_, _]}} = equality(1, 2)
     end
 
-    defn inequality(a, b), do: a != b
+    defn(inequality(a, b), do: a != b)
 
     test "!=" do
       assert %T{data: %Expr{op: :not_equal, args: [_, _]}} = inequality(1, 2)
     end
 
-    defn less_than(a, b), do: a < b
+    defn(less_than(a, b), do: a < b)
 
     test "<" do
       assert %T{data: %Expr{op: :less, args: [_, _]}} = less_than(1, 2)
     end
 
-    defn greater_than(a, b), do: a > b
+    defn(greater_than(a, b), do: a > b)
 
     test ">" do
       assert %T{data: %Expr{op: :greater, args: [_, _]}} = greater_than(1, 2)
     end
 
-    defn less_than_or_equal(a, b), do: a <= b
+    defn(less_than_or_equal(a, b), do: a <= b)
 
     test "<=" do
       assert %T{data: %Expr{op: :less_equal, args: [_, _]}} = less_than_or_equal(1, 2)
     end
 
-    defn greater_than_or_equal(a, b), do: a >= b
+    defn(greater_than_or_equal(a, b), do: a >= b)
 
     test ">=" do
       assert %T{data: %Expr{op: :greater_equal, args: [_, _]}} = greater_than_or_equal(1, 2)
@@ -798,20 +803,10 @@ defmodule Nx.DefnTest do
     test "min/2" do
       assert %T{data: %Expr{op: :min, args: [_, _]}} = min_two(1, 2)
     end
-
-    defn maxu(a), do: rewrite_types(a, max_unsigned_type: {:u, 32})
-    defn maxs(a), do: rewrite_types(a, max_signed_type: {:s, 32})
-    defn maxf(a), do: rewrite_types(a, max_float_type: {:f, 32})
-
-    test "max_*_type/2" do
-      assert %T{data: %Expr{op: :as_type, args: [_]}} = maxu(Nx.tensor(1, type: {:u, 64}))
-      assert %T{data: %Expr{op: :as_type, args: [_]}} = maxs(Nx.tensor(1, type: {:s, 64}))
-      assert %T{data: %Expr{op: :as_type, args: [_]}} = maxf(Nx.tensor(1, type: {:f, 64}))
-    end
   end
 
   describe "access" do
-    defn single_access(t), do: {t[0], t[-1]}
+    defn(single_access(t), do: {t[0], t[-1]})
 
     test "single dimensional single access" do
       {zero, minus_one} = single_access(Nx.tensor([1, 2, 3, 4, 5]))
@@ -839,7 +834,7 @@ defmodule Nx.DefnTest do
              } = slice
     end
 
-    defn multi_access(t), do: t[1][2][3]
+    defn(multi_access(t), do: t[1][2][3])
 
     test "multi dimensional multi-access with integers is collapsed" do
       assert %T{data: %Expr{op: :squeeze, args: [slice, [0, 1, 2]]}, shape: {}} =
@@ -851,7 +846,7 @@ defmodule Nx.DefnTest do
              } = slice
     end
 
-    defn range_access(t), do: t[1][1..2]
+    defn(range_access(t), do: t[1][1..2])
 
     test "multi dimensional multi-access with ranges is collapsed" do
       assert %T{data: %Expr{op: :squeeze, args: [slice, [0]]}, shape: {2, 5}} =
@@ -863,7 +858,19 @@ defmodule Nx.DefnTest do
              } = slice
     end
 
-    defn keyword_access(t), do: t[[z: 1..-2//1]][[y: 1..2]]
+    defn(mixed_access(t), do: t[[.., Nx.u32(0)]])
+
+    test "multi dimensional mixed-type access" do
+      assert %T{data: %Expr{op: :squeeze, args: [slice, [1]]}, shape: {3}} =
+               mixed_access(Nx.iota({3, 4}))
+
+      assert %T{data: %Expr{op: :slice, args: [_, [i, j], [3, 1], [1, 1]]}, shape: {3, 1}} = slice
+
+      assert i.type == {:u, 32}
+      assert j.type == {:u, 32}
+    end
+
+    defn(keyword_access(t), do: t[[z: 1..-2//1]][[y: 1..2]])
 
     test "multi dimensional multi-access with keywords is collapsed" do
       assert %T{
@@ -872,7 +879,7 @@ defmodule Nx.DefnTest do
              } = keyword_access(Nx.iota({3, 4, 5}, names: [:x, :y, :z]))
     end
 
-    defn elixir_access(a, opts \\ []), do: Nx.sum(a, axes: opts[:axes])
+    defn(elixir_access(a, opts \\ []), do: Nx.sum(a, axes: opts[:axes]))
 
     test "also works for other Elixir data structures" do
       assert %T{data: %Expr{op: :sum, args: [_, [axes: [1], keep_axes: false]]}} =
@@ -880,38 +887,350 @@ defmodule Nx.DefnTest do
     end
   end
 
+  describe "optional" do
+    defn(cumsum(t), do: Nx.cumulative_sum(t))
+
+    @tag compiler: Evaluator
+    test "cummulative" do
+      assert cumsum(Nx.tensor([1, 2, 3, 4])) == Nx.tensor([1, 3, 6, 10])
+      assert cumsum(Nx.tensor([1, 2, 3, 4], names: [:x])) == Nx.tensor([1, 3, 6, 10], names: [:x])
+    end
+  end
+
   describe "lu" do
-    defn lu(t), do: Nx.LinAlg.lu(t)
+    defn(lu(t), do: Nx.LinAlg.lu(t))
 
     test "returns tuples" do
       assert {p, l, u} = lu(Nx.iota({3, 3}))
 
-      assert %T{data: %Expr{op: :elem, args: [lu_expr, 0, 3]}, shape: {3, 3}} = p
-      assert %T{data: %Expr{op: :elem, args: [^lu_expr, 1, 3]}, shape: {3, 3}} = l
-      assert %T{data: %Expr{op: :elem, args: [^lu_expr, 2, 3]}, shape: {3, 3}} = u
+      assert %T{data: %Expr{op: :elem, args: [lu_expr, 0]}, shape: {3, 3}} = p
+      assert %T{data: %Expr{op: :elem, args: [^lu_expr, 1]}, shape: {3, 3}} = l
+      assert %T{data: %Expr{op: :elem, args: [^lu_expr, 2]}, shape: {3, 3}} = u
     end
   end
 
   describe "qr" do
-    defn qr(t), do: Nx.LinAlg.qr(t)
+    defn(qr(t), do: Nx.LinAlg.qr(t))
 
     test "returns tuples" do
       assert {left, right} = qr(Nx.iota({3, 2}))
 
-      assert %T{data: %Expr{op: :elem, args: [qr_expr, 0, 2]}, shape: {3, 2}} = left
-      assert %T{data: %Expr{op: :elem, args: [^qr_expr, 1, 2]}, shape: {2, 2}} = right
+      assert %T{data: %Expr{op: :elem, args: [qr_expr, 0]}, shape: {3, 2}} = left
+      assert %T{data: %Expr{op: :elem, args: [^qr_expr, 1]}, shape: {2, 2}} = right
     end
   end
 
   describe "svd" do
-    defn svd(t), do: Nx.LinAlg.svd(t)
+    defn(svd(t), do: Nx.LinAlg.svd(t))
 
     test "returns tuples" do
       assert {u, s, vt} = svd(Nx.iota({3, 3}))
 
-      assert %T{data: %Expr{op: :elem, args: [svd_expr, 0, 3]}, shape: {3, 3}} = u
-      assert %T{data: %Expr{op: :elem, args: [^svd_expr, 1, 3]}, shape: {3}} = s
-      assert %T{data: %Expr{op: :elem, args: [^svd_expr, 2, 3]}, shape: {3, 3}} = vt
+      assert %T{data: %Expr{op: :elem, args: [svd_expr, 0]}, shape: {3, 3}} = u
+      assert %T{data: %Expr{op: :elem, args: [^svd_expr, 1]}, shape: {3}} = s
+      assert %T{data: %Expr{op: :elem, args: [^svd_expr, 2]}, shape: {3, 3}} = vt
+    end
+  end
+
+  describe "block" do
+    defmodule VectorizedNonlinear do
+      defstruct []
+    end
+
+    test "raises when the body mixes an argument with a tensor from the enclosing scope" do
+      assert_raise RuntimeError, ~r/expressions come from different contexts/, fn ->
+        Nx.Defn.jit(fn x, weight ->
+          Nx.block(%VectorizedNonlinear{}, [x], nil, fn _, x -> Nx.multiply(x, weight) end)
+        end).(Nx.tensor([1.0, 2.0, 3.0]), Nx.tensor([2.0, 3.0, 4.0]))
+      end
+    end
+
+    test "raises when the body returns a tensor from the enclosing scope" do
+      assert_raise ArgumentError, ~r/returned a tensor from the enclosing scope/, fn ->
+        Nx.Defn.jit(fn x, y ->
+          Nx.block(%VectorizedNonlinear{}, [x], nil, fn _, _x -> y end)
+        end).(Nx.tensor([1.0, 2.0]), Nx.tensor([3.0, 4.0]))
+      end
+    end
+
+    test "raises when the body reads a tensor from the enclosing scope inside grad" do
+      assert_raise RuntimeError, ~r/expressions come from different contexts/, fn ->
+        Nx.Defn.jit(fn x, w ->
+          grad(w, fn w ->
+            Nx.sum(
+              Nx.block(%VectorizedNonlinear{}, [x], nil, fn _, x -> Nx.sin(Nx.dot(x, w)) end)
+            )
+          end)
+        end).(Nx.tensor([[0.5, 1.0], [1.5, 2.0]]), Nx.tensor([[0.5, -0.3], [0.2, 0.8]]))
+      end
+    end
+
+    @tag compiler: Evaluator
+    test "applies gradients for a block whose output is a constant-creating comparison" do
+      input = Nx.tensor([-0.7, 0.3, 0.7])
+      body = fn _, argument -> Nx.greater(argument, 0) end
+
+      gradient =
+        grad(input, fn argument ->
+          Nx.sum(Nx.block(%VectorizedNonlinear{}, [argument], nil, body))
+        end)
+
+      assert_equal(gradient, Nx.broadcast(0.0, {3}))
+    end
+
+    @tag compiler: Evaluator
+    test "applies gradients for a block returning a value and a constant-creating mask" do
+      input = Nx.tensor([-0.7, 0.3, 0.7])
+      body = fn _, argument -> {Nx.sin(argument), Nx.greater(argument, 0)} end
+
+      plain =
+        grad(input, fn argument ->
+          Nx.sum(Nx.multiply(Nx.sin(argument), Nx.greater(argument, 0)))
+        end)
+
+      expected = Nx.select(Nx.greater(input, 0), Nx.cos(input), 0)
+      assert_all_close(plain, expected)
+
+      gradient =
+        grad(input, fn argument ->
+          {value, mask} = Nx.block(%VectorizedNonlinear{}, [argument], nil, body)
+          Nx.sum(Nx.multiply(value, mask))
+        end)
+
+      assert_all_close(gradient, expected)
+    end
+
+    @tag compiler: Evaluator
+    test "applies gradients when a constant-creating block output is unused" do
+      input = Nx.tensor([-0.7, 0.3, 0.7])
+
+      gradient =
+        grad(input, fn argument ->
+          {value, _mask} =
+            Nx.block(%VectorizedNonlinear{}, [argument], nil, fn _, argument ->
+              {Nx.sin(argument), Nx.greater(argument, 0)}
+            end)
+
+          Nx.sum(value)
+        end)
+
+      assert_all_close(gradient, Nx.cos(input))
+    end
+
+    @tag compiler: Evaluator
+    test "applies gradients for a block whose output is a constant-creating floor" do
+      input = Nx.tensor([-0.7, 0.3, 1.7])
+
+      gradient =
+        grad(input, fn argument ->
+          Nx.sum(
+            Nx.block(%VectorizedNonlinear{}, [argument], nil, fn _, argument ->
+              Nx.floor(argument)
+            end)
+          )
+        end)
+
+      assert_equal(gradient, Nx.broadcast(0.0, {3}))
+    end
+
+    @tag compiler: Evaluator
+    test "applies gradients for blocks with constant-creating outputs and vectorized inputs" do
+      input = Nx.tensor([[-0.7, 0.3], [0.7, -0.3]]) |> Nx.vectorize(:batch)
+
+      gradient =
+        grad(input, fn argument ->
+          {value, mask} =
+            Nx.block(%VectorizedNonlinear{}, [argument], nil, fn _, argument ->
+              {Nx.sin(argument), Nx.greater(argument, 0)}
+            end)
+
+          Nx.sum(Nx.multiply(value, mask))
+        end)
+
+      assert gradient.vectorized_axes == [batch: 2]
+      assert_all_close(gradient, Nx.select(Nx.greater(input, 0), Nx.cos(input), 0))
+    end
+
+    @tag compiler: Evaluator
+    test "applies gradients for a constant-creating mask consumed inside the block" do
+      input = Nx.tensor([-0.7, 0.3, 0.7])
+
+      gradient =
+        grad(input, fn argument ->
+          Nx.sum(
+            Nx.block(%VectorizedNonlinear{}, [argument], nil, fn _, argument ->
+              Nx.multiply(Nx.sin(argument), Nx.greater(argument, 0))
+            end)
+          )
+        end)
+
+      assert_all_close(gradient, Nx.select(Nx.greater(input, 0), Nx.cos(input), 0))
+    end
+
+    @tag compiler: Evaluator
+    test "differentiates nonlinear vectorized block outputs" do
+      input = Nx.tensor([[0.0, 1.0], [2.0, 3.0]]) |> Nx.vectorize(:batch)
+
+      actual =
+        Nx.Defn.jit(fn input ->
+          grad(input, fn x ->
+            value =
+              Nx.block(%VectorizedNonlinear{}, [x], nil, fn _, x ->
+                Nx.add(Nx.sin(x), Nx.cos(x))
+              end)
+
+            Nx.sum(Nx.exp(value))
+          end)
+        end).(input)
+
+      expected =
+        Nx.multiply(
+          Nx.exp(Nx.add(Nx.sin(input), Nx.cos(input))),
+          Nx.subtract(Nx.cos(input), Nx.sin(input))
+        )
+
+      Nx.Testing.assert_all_close(actual, expected)
+    end
+
+    defmodule ContainerBlock do
+      defstruct []
+    end
+
+    @tag compiler: Evaluator
+    test "accepts a container argument" do
+      x = Nx.tensor([1.0, 2.0, 3.0])
+      weights = %{scale: Nx.tensor([2.0, 3.0, 4.0]), bias: Nx.tensor(0.5)}
+
+      fun = fn x, weights ->
+        Nx.block(%ContainerBlock{}, [x, weights], nil, fn _, x, %{scale: scale, bias: bias} ->
+          Nx.add(Nx.multiply(x, scale), bias)
+        end)
+      end
+
+      assert_equal(Nx.Defn.jit(fun).(x, weights), Nx.tensor([2.5, 6.5, 12.5]))
+
+      expr = Nx.Defn.debug_expr(fun).(x, weights)
+      assert inspect(expr) =~ "block %Nx.DefnTest.ContainerBlock{}, a, b, c"
+    end
+
+    @tag compiler: Evaluator
+    test "accepts a container argument with a vectorized entry" do
+      left = Nx.tensor([[0.0, 1.0], [2.0, 3.0]]) |> Nx.vectorize(:batch)
+      right = Nx.tensor([0.5, 1.5])
+
+      {actual, mask} =
+        Nx.Defn.jit(fn pair ->
+          Nx.block(%ContainerBlock{}, [pair], nil, fn _, {left, right} ->
+            {Nx.add(Nx.sin(left), Nx.cos(right)), Nx.greater(left, right)}
+          end)
+        end).({left, right})
+
+      assert_all_close(actual, Nx.add(Nx.sin(left), Nx.cos(right)))
+      assert_equal(mask, Nx.greater(left, right))
+    end
+
+    @tag compiler: Evaluator
+    test "differentiates through a container argument" do
+      x = Nx.tensor([[0.5, 1.0], [1.5, 2.0]])
+      w = Nx.tensor([[0.5, -0.3], [0.2, 0.8]])
+
+      actual =
+        Nx.Defn.jit(fn x, w ->
+          grad({x, w}, fn {x, w} ->
+            Nx.sum(
+              Nx.block(%ContainerBlock{}, [{x, w}], nil, fn _, {x, w} ->
+                Nx.sin(Nx.dot(x, w))
+              end)
+            )
+          end)
+        end).(x, w)
+
+      expected =
+        Nx.Defn.jit(fn x, w -> grad({x, w}, fn {x, w} -> Nx.sum(Nx.sin(Nx.dot(x, w))) end) end).(
+          x,
+          w
+        )
+
+      {actual_x, actual_w} = actual
+      {expected_x, expected_w} = expected
+      assert_all_close(actual_x, expected_x)
+      assert_all_close(actual_w, expected_w)
+    end
+
+    @tag compiler: Evaluator
+    test "takes more tensors in one container than a function can take as arguments" do
+      count = 300
+      tensors = Enum.map(1..count, &Nx.tensor(&1 * 1.0))
+
+      sum_all = fn tensors ->
+        Nx.block(%ContainerBlock{}, [tensors], nil, fn _, tensors ->
+          tensors |> Tuple.to_list() |> Nx.stack() |> Nx.sum()
+        end)
+      end
+
+      result = Nx.Defn.jit(sum_all).(List.to_tuple(tensors))
+      assert_equal(result, Nx.tensor(count * (count + 1) / 2))
+
+      gradient =
+        Nx.Defn.jit(fn tensors -> grad(tensors, sum_all) end).(List.to_tuple(tensors))
+
+      assert tuple_size(gradient) == count
+      assert_equal(elem(gradient, 0), Nx.tensor(1.0))
+      assert_equal(elem(gradient, count - 1), Nx.tensor(1.0))
+    end
+
+    @tag compiler: Evaluator
+    test "accepts a constant tensor argument" do
+      rhs = Nx.tensor([4.0, 3.0, 2.0])
+      mat = Nx.tensor([[4.0, 1.0, 0.5], [1.0, 3.0, 0.2], [0.5, 0.2, 2.0]])
+
+      assert_all_close(
+        Nx.Defn.jit(fn a -> Nx.LinAlg.solve(a, rhs) end).(mat),
+        Nx.LinAlg.solve(mat, rhs)
+      )
+    end
+
+    defmodule PerEntrySum do
+      defstruct []
+    end
+
+    @tag compiler: Evaluator
+    test "keeps vectorized entries apart" do
+      input = Nx.tensor([[2.0, 1.0], [0.5, 3.0]]) |> Nx.vectorize(:batch)
+      body = fn _, x -> Nx.sum(Nx.sin(x)) end
+
+      parameter = Nx.Defn.jit(fn x -> Nx.block(%PerEntrySum{}, [x], nil, body) end).(input)
+      assert parameter.vectorized_axes == [batch: 2]
+      assert_all_close(parameter, Nx.sum(Nx.sin(input)))
+
+      intermediate =
+        Nx.Defn.jit(fn x -> Nx.block(%PerEntrySum{}, [Nx.cos(x)], nil, body) end).(input)
+
+      assert intermediate.vectorized_axes == [batch: 2]
+      assert_all_close(intermediate, Nx.sum(Nx.sin(Nx.cos(input))))
+    end
+
+    @tag compiler: Evaluator
+    test "accepts a vectorized tensor captured from outside the function" do
+      captured = Nx.tensor([[0.5, 1.0], [1.5, 2.0], [2.5, 3.0]]) |> Nx.vectorize(:batch)
+      weight = Nx.tensor([[0.5, -0.3], [0.2, 0.8]])
+      body = fn _, x, w -> Nx.sin(Nx.dot(x, w)) end
+
+      forward =
+        Nx.Defn.jit(fn w -> Nx.block(%PerEntrySum{}, [captured, w], nil, body) end).(weight)
+
+      assert forward.vectorized_axes == [batch: 3]
+      assert_all_close(forward, Nx.sin(Nx.dot(captured, weight)))
+
+      gradient =
+        Nx.Defn.grad(weight, fn w ->
+          Nx.sum(Nx.block(%PerEntrySum{}, [captured, w], nil, body))
+        end)
+
+      assert_all_close(
+        gradient,
+        Nx.Defn.grad(weight, fn w -> Nx.sum(Nx.sin(Nx.dot(captured, w))) end)
+      )
     end
   end
 
@@ -948,7 +1267,7 @@ defmodule Nx.DefnTest do
     end
 
     test "internal" do
-      assert %T{data: %Expr{op: :add, args: [_, _]}} = add_two_from_external_macro(1, 2)
+      assert %T{data: %Expr{op: :add, args: [_, _]}} = add_two_from_internal_macro(1, 2)
     end
 
     defn add_two_from_alias(a, b) do
@@ -970,7 +1289,7 @@ defmodule Nx.DefnTest do
 
     dynamic_name = String.to_atom(Enum.join(~w(dynamic name add two), "_"))
     operator = :add
-    defn unquote(dynamic_name)(left, right), do: Nx.unquote(operator)(left, right)
+    defn(unquote(dynamic_name)(left, right), do: Nx.unquote(operator)(left, right))
 
     test "dynamic name" do
       assert %T{data: %Expr{op: :add, args: [_, _]}} = dynamic_name_add_two(1, 2)
@@ -1014,10 +1333,13 @@ defmodule Nx.DefnTest do
       assert %T{data: %Expr{op: :add, args: [_, _]}} = add_two_remote(1, 2)
     end
 
-    defn add_two_unknown(a, b), do: Nx.DefnTest.unknown(a, b)
+    defn add_two_dynamic(a, b, opts \\ []), do: opts[:remote].add_two(a, b)
 
-    def not_defn(a, b), do: Nx.add(a, b)
-    defn add_two_not_defn(a, b), do: Nx.DefnTest.not_defn(a, b)
+    test "dynamic" do
+      assert %T{data: %Expr{op: :add, args: [_, _]}} = add_two_remote(1, 2)
+    end
+
+    defn add_two_unknown(a, b), do: Nx.DefnTest.unknown(a, b)
 
     test "undefined remote" do
       assert_raise UndefinedFunctionError,
@@ -1025,16 +1347,31 @@ defmodule Nx.DefnTest do
                    fn -> add_two_unknown(1, 2) end
     end
 
+    def not_defn(a, b), do: Nx.add(a, b)
+    defn add_two_not_defn(a, b), do: Nx.DefnTest.not_defn(a, b)
+
     test "not defn remote" do
       assert_raise RuntimeError,
                    "cannot invoke Nx.DefnTest.not_defn/2 inside defn because it was not defined with defn",
                    fn -> add_two_not_defn(1, 2) end
     end
+
+    defn add_two_io(a, b), do: IO.inspect({a, b})
+
+    test "IO remote" do
+      assert_raise RuntimeError,
+                   "cannot invoke IO.inspect/1 inside defn because it was not defined with defn. " <>
+                     "To print the runtime value of a tensor, use print_value/2. " <>
+                     "To print the tensor expression, use print_expr/2",
+                   fn -> add_two_io(1, 2) end
+    end
   end
 
   describe "if" do
-    defn if3(a, b, c), do: if(a, do: b, else: c)
-    defn if2(a, b), do: if(a, do: b)
+    defn(if3(a, b, c), do: if(a, do: b, else: c))
+    defn(if2(a, b), do: if(a, do: b))
+    defn(if_map(a, b, c), do: if(a, do: %{foo: b}, else: %{foo: c}))
+    defn(if_scalar_error(a), do: if(a, do: {1, 2}, else: {3}))
 
     test "converges types" do
       assert %T{data: %Expr{op: :cond}, shape: {}, type: {:f, 32}} =
@@ -1058,6 +1395,135 @@ defmodule Nx.DefnTest do
                  Nx.tensor([[3], [4]], names: [:x, nil])
                )
     end
+
+    test "preserves maps" do
+      assert %{foo: %T{data: %Expr{op: :cond}, shape: {}, type: {:s, 32}}} =
+               if_map(Nx.tensor(0), Nx.tensor(1), Nx.tensor(2))
+    end
+
+    defn if_branch_elimination(a) do
+      if Nx.rank(a) == 0 do
+        11
+      else
+        13
+      end
+    end
+
+    test "eliminates branches" do
+      assert %T{data: %Expr{op: :constant, args: [11]}} = if_branch_elimination(Nx.tensor(0))
+
+      assert %T{data: %Expr{op: :constant, args: [13]}} =
+               if_branch_elimination(Nx.tensor([1, 2, 3]))
+    end
+
+    defn if_branch_elimination_complex(a) do
+      if elem(Nx.shape(a), Nx.rank(a) - 1) == 1 do
+        11
+      else
+        13
+      end
+    end
+
+    test "eliminates complex branches" do
+      assert %T{data: %Expr{op: :constant, args: [11]}} =
+               if_branch_elimination_complex(Nx.iota({1, 1}))
+
+      assert %T{data: %Expr{op: :constant, args: [13]}} =
+               if_branch_elimination_complex(Nx.iota({3, 3}))
+    end
+
+    defn if_branch_elimination_transform(a) do
+      if if_branch_elimination_transform_pred(a) do
+        11
+      else
+        13
+      end
+    end
+
+    deftransformp if_branch_elimination_transform_pred(a) do
+      if Nx.rank(a) == 0, do: 1, else: 0
+    end
+
+    test "eliminates branches from transform" do
+      assert %T{data: %Expr{op: :constant, args: [11]}} =
+               if_branch_elimination_transform(Nx.tensor(0))
+
+      assert %T{data: %Expr{op: :constant, args: [13]}} =
+               if_branch_elimination_transform(Nx.tensor([1, 2, 3]))
+    end
+
+    defn if_assignment(a, b) do
+      d =
+        if c = Nx.all(a) do
+          b
+        else
+          -b
+        end
+
+      c + d
+    end
+
+    @tag compiler: Evaluator
+    test "returns assignment from if" do
+      assert if_assignment(Nx.tensor([1, 2, 3]), Nx.tensor([1, 2, 3])) == Nx.tensor([2, 3, 4])
+      assert if_assignment(Nx.tensor([0, 1, 2]), Nx.tensor([1, 2, 3])) == Nx.tensor([-1, -2, -3])
+    end
+
+    defn if_boolean(opts \\ []) do
+      if opts[:boolean] do
+        1
+      else
+        -1
+      end
+    end
+
+    test "evaluates boolean predicates" do
+      assert if_boolean(boolean: true) == Expr.tensor(1)
+      assert if_boolean(boolean: false) == Expr.tensor(-1)
+
+      assert_raise CompileError,
+                   ~r"cond in defn expects the predicate to be true, false, or a scalar tensor",
+                   fn -> if_boolean(boolean: nil) end
+    end
+
+    defn if_boolean_raise(opts \\ []) do
+      if opts[:boolean] do
+        1
+      else
+        raise ArgumentError, "oops"
+      end
+    end
+
+    test "does not evaluate the other boolean branch" do
+      assert if_boolean_raise(boolean: true) == Expr.tensor(1)
+    end
+
+    test "raises when the boolean else branch is taken" do
+      assert_raise ArgumentError, "oops", fn -> if_boolean_raise(boolean: false) end
+    end
+
+    defn if_rank_raise(t) do
+      if Nx.rank(t) != 2 do
+        raise ArgumentError, "tensor must have rank 2"
+      end
+
+      {r, c} = Nx.shape(t)
+      r + c
+    end
+
+    test "aborts tracing when a known if predicate raises" do
+      assert_raise ArgumentError, "tensor must have rank 2", fn ->
+        if_rank_raise(Nx.tensor([1, 2, 3]))
+      end
+
+      assert if_rank_raise(Nx.tensor([[1, 2], [3, 4]])) == Expr.tensor(4)
+    end
+
+    test "raises correct error on incompatible shapes" do
+      assert_raise CompileError, ~r/cond\/if expects all branches/, fn ->
+        if_scalar_error(Nx.tensor(0))
+      end
+    end
   end
 
   describe "cond" do
@@ -1070,7 +1536,7 @@ defmodule Nx.DefnTest do
     end
 
     test "supports multiple clauses" do
-      assert %T{data: %Expr{op: :cond, args: [clauses, last]}, shape: {}, type: {:s, 64}} =
+      assert %T{data: %Expr{op: :cond, args: [clauses, last]}, shape: {}, type: {:s, 32}} =
                cond4(Nx.tensor(0), Nx.tensor(1), Nx.tensor(2), Nx.tensor(3))
 
       [{first_head, first_body}, {second_head, second_body}] = clauses
@@ -1101,31 +1567,393 @@ defmodule Nx.DefnTest do
                )
     end
 
-    defn cond_lit(a) do
-      if Nx.any?(a), do: 1, else: -1
+    defn cond_upcast_float_literals(n) do
+      cond do
+        n == 1 -> 1.4
+        n == 2 -> 2
+        true -> n
+      end
     end
 
+    test "upcasts float literals based on the accumulated clause type" do
+      for input_type <- [f: 32, f: 64] do
+        assert %T{
+                 type: ^input_type,
+                 data: %Expr{op: :cond, args: [[clause1, clause2], _last]}
+               } =
+                 cond_upcast_float_literals(Nx.tensor(10.0, type: input_type))
+
+        assert {_, %T{type: ^input_type, data: %Expr{op: :constant, args: [1.4]}}} = clause1
+        assert {_, %T{type: ^input_type, data: %Expr{op: :constant, args: [2.0]}}} = clause2
+      end
+
+      for input_type <- [c: 64, c: 128] do
+        assert %T{
+                 type: ^input_type,
+                 data: %Expr{op: :cond, args: [[clause1, clause2], _last]}
+               } =
+                 cond_upcast_float_literals(Nx.tensor(10.0, type: input_type))
+
+        assert {_,
+                %T{
+                  type: ^input_type,
+                  data: %Expr{op: :constant, args: [%Complex{re: 1.4, im: +0.0}]}
+                }} = clause1
+
+        assert {_,
+                %T{
+                  type: ^input_type,
+                  data: %Expr{op: :constant, args: [%Complex{re: 2.0, im: +0.0}]}
+                }} =
+                 clause2
+      end
+    end
+
+    defn cond_list(a) do
+      if Nx.any(a), do: 1, else: -1
+    end
+
+    @tag compiler: Evaluator
     test "supports literals" do
-      assert cond_lit(Nx.tensor(0)), do: Nx.tensor(-1)
-      assert cond_lit(Nx.tensor(1)), do: Nx.tensor(1)
+      assert cond_list(Nx.tensor(0)) == Nx.tensor(-1)
+      assert cond_list(Nx.tensor(1)) == Nx.tensor(1)
+    end
+
+    defn cond_empty_map(a) do
+      if Nx.any(a), do: %{}, else: %{}
+    end
+
+    test "handles empty maps in branches" do
+      assert cond_empty_map(Nx.tensor(0)) == %{}
+      assert cond_empty_map(Nx.tensor(0)) == %{}
+    end
+
+    defn cond_branch_elimination(a, b) do
+      cond do
+        Nx.rank(b) != 0 -> 7
+        Nx.rank(a) == 0 -> 11
+        true -> 13
+      end
+    end
+
+    test "eliminates branches" do
+      assert %T{data: %Expr{op: :constant, args: [7]}} =
+               cond_branch_elimination(Nx.tensor(0), Nx.tensor([1, 2, 3]))
+
+      assert %T{data: %Expr{op: :constant, args: [7]}} =
+               cond_branch_elimination(Nx.tensor([1, 2, 3]), Nx.tensor([1, 2, 3]))
+
+      assert %T{data: %Expr{op: :constant, args: [11]}} =
+               cond_branch_elimination(Nx.tensor(0), Nx.tensor(0))
+
+      assert %T{data: %Expr{op: :constant, args: [13]}} =
+               cond_branch_elimination(Nx.tensor([1, 2, 3]), Nx.tensor(0))
+    end
+
+    defn cond_branch_variable_access(a) do
+      cond do
+        b = Nx.all(a > 0) -> a + b
+        b = Nx.all(a < 0) -> a - b
+        true -> a
+      end
+    end
+
+    @tag compiler: Evaluator
+    test "access variable from condition" do
+      assert cond_branch_variable_access(Nx.tensor([1, 2, 3])) == Nx.tensor([2, 3, 4])
+      assert cond_branch_variable_access(Nx.tensor([-1, -2, -3])) == Nx.tensor([-2, -3, -4])
+      assert cond_branch_variable_access(Nx.tensor([-1, 0, 1])) == Nx.tensor([-1, 0, 1])
+    end
+
+    defn bad_cond(a) do
+      cond do
+        Nx.any(a) -> +a
+        Nx.all(a) -> -a
+      end
     end
 
     test "raises if cond is missing last atom clause" do
-      assert_raise CompileError, ~r"expected the last clause of cond to match on an atom", fn ->
-        defmodule InvalidCond do
-          defn badcond(a) do
-            cond do
-              Nx.any?(a) -> +a
-              Nx.all?(a) -> -a
-            end
-          end
-        end
-      end
+      assert_raise CompileError,
+                   ~r"cond/if expects at least one branch to always evaluate to true",
+                   fn -> bad_cond(1) end
     end
 
     test "raises if given a non-scalar as condition" do
       assert_raise CompileError, ~r"condition must be a scalar tensor, got:", fn ->
         cond4(Nx.tensor([0, 0]), Nx.tensor(1), Nx.tensor(2), Nx.tensor(3))
+      end
+    end
+
+    defn non_tensor_cond(a) do
+      if Nx.any(a) do
+        :foo
+      else
+        :bar
+      end
+    end
+
+    test "raises on non-tensor return" do
+      assert_raise CompileError,
+                   ~r"cond/if expects all branches to return compatible tensor types.\n\n\e\[32m\n<<<<< First Branch \(expected\) <<<<<\n:foo\n==========\n\e\[31m:bar\n>>>>>        Branch 1         >>>>>\n\e\[0m\n",
+                   fn -> non_tensor_cond(1) end
+    end
+
+    test "supports vectorized plain branches" do
+      a = Nx.iota({2}, vectorized_axes: [x: 2, y: 1])
+      b = 2
+      c = Nx.tensor([[1, 2]]) |> Nx.vectorize(x: 1, y: 2)
+
+      assert inspect(cond4(-1, a, b, c)) ==
+               String.trim("""
+               #Nx.Tensor<
+                 vectorized[x: 2][y: 2]
+                 s32[2]
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0                           s32
+                 parameter c:1                           s32[2][1][2]
+                 parameter g:2                           s32
+                 parameter k:3                           s32[1][2]
+                 b = greater a, 0                        u8
+                 d = add 1, c                            s32[2][1][2]
+                 e = broadcast d, {2, 2, 2}, [0, 1, 2]   s32[2][2][2]
+                 f = less a, 0                           u8
+                 h = subtract g, 1                       s32
+                 i = reshape h                           s32[1][1][1]
+                 j = broadcast i, {2, 2, 2}, [0, 1, 2]   s32[2][2][2]
+                 l = multiply 2, k                       s32[1][2]
+                 m = reshape l                           s32[1][2][1]
+                 n = broadcast m, {2, 2, 2}, [0, 1, 2]   s32[2][2][2]
+                 o = cond b -> e, f -> j, true -> n      s32[2][2][2]
+               >
+               """)
+
+      Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+      assert cond4(-1, a, b, c) ==
+               Nx.tensor([
+                 [
+                   [1, 1],
+                   [1, 1]
+                 ],
+                 [
+                   [1, 1],
+                   [1, 1]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, y: 2)
+
+      assert cond4(0, a, b, c) ==
+               Nx.tensor([
+                 [
+                   [2, 2],
+                   [4, 4]
+                 ],
+                 [
+                   [2, 2],
+                   [4, 4]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, y: 2)
+
+      assert cond4(1, a, b, c) ==
+               Nx.tensor([
+                 [
+                   [1, 2],
+                   [1, 2]
+                 ],
+                 [
+                   [1, 2],
+                   [1, 2]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, y: 2)
+    end
+
+    defn cond_container(pred, x, y) do
+      cond do
+        pred ->
+          x
+
+        true ->
+          y
+      end
+    end
+
+    test "supports vectorized container branches" do
+      a = Nx.iota({2}, vectorized_axes: [x: 2, y: 1])
+      b = 2
+      c = Nx.tensor([[[1], [2]]]) |> Nx.vectorize(z: 1, w: 2)
+
+      on_true = {a, b}
+      on_false = {b, c}
+
+      assert inspect(cond_container(0, on_true, on_false)) ==
+               String.trim("""
+               {#Nx.Tensor<
+                  vectorized[x: 2][y: 1]
+                  s32[2]
+                \s\s
+                  Nx.Defn.Expr
+                  parameter a:0                           s32
+                  parameter b:1                           s32[2][1][2]
+                  parameter c:2                           s32
+                  parameter f:3                           s32
+                  parameter i:4                           s32[1][2][1]
+                  d = reshape c                           s32[1][1][1]
+                  e = broadcast d, {1, 2, 1}, [0, 1, 2]   s32[1][2][1]
+                  g = reshape f                           s32[1][1][1]
+                  h = broadcast g, {2, 1, 2}, [0, 1, 2]   s32[2][1][2]
+                  j = cond a -> {b, e}, true -> {h, i}    tuple2
+                  k = elem j, 0                           s32[2][1][2]
+                >, #Nx.Tensor<
+                  vectorized[z: 1][w: 2]
+                  s32[1]
+                \s\s
+                  Nx.Defn.Expr
+                  parameter a:0                           s32
+                  parameter b:1                           s32[2][1][2]
+                  parameter c:2                           s32
+                  parameter f:3                           s32
+                  parameter i:4                           s32[1][2][1]
+                  d = reshape c                           s32[1][1][1]
+                  e = broadcast d, {1, 2, 1}, [0, 1, 2]   s32[1][2][1]
+                  g = reshape f                           s32[1][1][1]
+                  h = broadcast g, {2, 1, 2}, [0, 1, 2]   s32[2][1][2]
+                  j = cond a -> {b, e}, true -> {h, i}    tuple2
+                  k = elem j, 1                           s32[1][2][1]
+                >}
+               """)
+
+      Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+      [b_vec_a, _] = Nx.broadcast_vectors([Nx.broadcast(b, a), a])
+      [b_vec_c, _] = Nx.broadcast_vectors([Nx.broadcast(b, c), c])
+
+      assert %{shape: {2}, vectorized_axes: [x: 2, y: 1]} = b_vec_a
+      assert %{shape: {1}, vectorized_axes: [z: 1, w: 2]} = b_vec_c
+
+      assert cond_container(1, on_true, on_false) == {a, b_vec_c}
+      assert cond_container(0, on_true, on_false) == {b_vec_a, c}
+    end
+  end
+
+  describe "case/2" do
+    defn simple_rank(tensor) do
+      case Nx.shape(tensor) do
+        {} -> 0
+        {_} -> 1
+        {_, _} -> 2
+      end
+    end
+
+    defn tuple_rank(tensorA, tensorB) do
+      case {Nx.shape(tensorA), Nx.shape(tensorB)} do
+        {{}, {}} -> 0
+        {{_}, {}} -> -1
+        {{}, {_}} -> 1
+      end
+    end
+
+    defn guard_rank(tensor) do
+      case Nx.shape(tensor) do
+        {x, x} -> 0
+        {x, y} when x > y -> -1
+        {x, y} when x < y -> 1
+      end
+    end
+
+    defn struct_case(opts \\ []) do
+      case opts[:struct] do
+        %URI{} -> 0
+        %Regex{} -> 1
+        %Nx.Tensor{} -> 2
+        _ -> 3
+      end
+    end
+
+    deftransformp(uri, do: %URI{})
+
+    defn invalid_case(tensor) do
+      case tensor do
+        _ -> 0
+      end
+    end
+
+    test "matches shapes" do
+      assert simple_rank(123) == Expr.tensor(0)
+      assert simple_rank(Nx.tensor([1, 2, 3])) == Expr.tensor(1)
+      assert simple_rank(Nx.tensor([[1, 2, 3]])) == Expr.tensor(2)
+    end
+
+    test "matches tuples shapes" do
+      assert tuple_rank(0, 0) == Expr.tensor(0)
+      assert tuple_rank(Nx.tensor([1, 2, 3]), 0) == Expr.tensor(-1)
+      assert tuple_rank(0, Nx.tensor([1, 2, 3])) == Expr.tensor(1)
+    end
+
+    test "matches struct names" do
+      assert struct_case(struct: %URI{}) == Expr.tensor(0)
+      assert struct_case(struct: ~r/foo/) == Expr.tensor(1)
+      assert struct_case(struct: Nx.tensor([1, 2, 3])) == Expr.tensor(2)
+      assert struct_case(struct: 123) == Expr.tensor(3)
+    end
+
+    test "matches using guards" do
+      assert guard_rank(Nx.iota({2, 2})) == Expr.tensor(0)
+      assert guard_rank(Nx.iota({3, 2})) == Expr.tensor(-1)
+      assert guard_rank(Nx.iota({2, 3})) == Expr.tensor(1)
+    end
+
+    test "raises if not tuple, atom, integer, or struct" do
+      assert_raise ArgumentError,
+                   ~r"only tuples, atoms, numbers, and structs are allowed as arguments to case/2 inside defn",
+                   fn -> invalid_case(%{}) end
+    end
+
+    test "raises on outside variables in guards" do
+      assert_raise CompileError,
+                   ~r"case/2 in defn allow guards to only access variables defined in patterns",
+                   fn ->
+                     defmodule Fail do
+                       defn invalid_case(y) do
+                         case y do
+                           x when x > y -> 1
+                         end
+                       end
+                     end
+                   end
+    end
+  end
+
+  describe "raise/2" do
+    defn raise_argument_error(tensor) do
+      case Nx.shape(tensor) do
+        {n, n} -> n
+        shape -> raise ArgumentError, "expected a square tensor: #{inspect(shape)}"
+      end
+    end
+
+    test "raises ArgumentError" do
+      assert raise_argument_error(Nx.iota({4, 4})) == Expr.tensor(4)
+
+      assert_raise ArgumentError, "expected a square tensor: {4, 3}", fn ->
+        raise_argument_error(Nx.iota({4, 3}))
+      end
+    end
+
+    defn raise_runtime_error(tensor) do
+      case Nx.shape(tensor) do
+        {n, n} -> n
+        shape -> raise "expected a square tensor: " <> inspect(shape)
+      end
+    end
+
+    test "raises RuntimeError" do
+      assert raise_runtime_error(Nx.iota({4, 4})) == Expr.tensor(4)
+
+      assert_raise RuntimeError, "expected a square tensor: {4, 3}", fn ->
+        raise_runtime_error(Nx.iota({4, 3}))
       end
     end
   end
@@ -1141,13 +1969,13 @@ defmodule Nx.DefnTest do
       assert %T{
                data: %Expr{op: :while, args: [initial, arg, condition, body]},
                shape: {},
-               type: {:s, 64}
+               type: {:s, 32}
              } = upto10(Nx.tensor(0))
 
-      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 64}} = initial
-      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 64}} = arg
+      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 32}} = initial
+      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 32}} = arg
       assert %T{data: %Expr{op: :less}, shape: {}, type: {:u, 8}} = condition
-      assert %T{data: %Expr{op: :add}, shape: {}, type: {:s, 64}} = body
+      assert %T{data: %Expr{op: :add}, shape: {}, type: {:s, 32}} = body
     end
 
     defn while_constant(x) do
@@ -1160,13 +1988,13 @@ defmodule Nx.DefnTest do
       assert %T{
                data: %Expr{op: :while, args: [initial, arg, condition, body]},
                shape: {},
-               type: {:s, 64}
+               type: {:s, 32}
              } = while_constant(Nx.tensor(0))
 
-      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 64}} = initial
-      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 64}} = arg
+      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 32}} = initial
+      assert %T{data: %Expr{op: :parameter}, shape: {}, type: {:s, 32}} = arg
       assert %T{data: %Expr{op: :less}, shape: {}, type: {:u, 8}} = condition
-      assert %T{data: %Expr{op: :scalar, args: [1]}, shape: {}, type: {:s, 64}} = body
+      assert %T{data: %Expr{op: :constant, args: [1]}, shape: {}, type: {:s, 32}} = body
     end
 
     defn factorial(x) do
@@ -1181,20 +2009,439 @@ defmodule Nx.DefnTest do
     test "factorial" do
       assert %T{} = factorial(5)
 
+      expected_error =
+        [
+          "the do-block in while must return tensors with the same shape, type, and names ",
+          "as the initial arguments.\n\n\\{\e\\[32m\n <<<<< Body \\(do-block\\) <<<<<\n ",
+          "#Nx.Tensor<\n   f32\n >\n ==========\n \e\\[31m#Nx.Tensor<\n   s32\n >\n >>>>>",
+          "     Initial     >>>>>\n \e\\[0m, #Nx.Tensor<\n   f32\n >\\}\n$"
+        ]
+        |> IO.iodata_to_binary()
+        |> Regex.compile!()
+
       assert_raise CompileError,
-                   ~r/the do-block in while must return the shape, type, and names as the initial arguments. Got body \{f32, f32\} and initial \{s64, f32\}/,
+                   expected_error,
                    fn -> factorial(10.0) end
+    end
+
+    defn add_complex(t) do
+      Nx.complex(t, 2)
+    end
+
+    test "complex numbers" do
+      t = add_complex(1)
+
+      assert inspect(t) ==
+               """
+               #Nx.Tensor<
+                 c64\n\s\s
+                 Nx.Defn.Expr
+                 parameter a:0         s32
+                 b = add 0.0+2.0i, a   c64
+               >
+               """
+               |> String.trim()
+    end
+
+    defn while_last(t) do
+      {_, last, _} =
+        while {i = 0, _last = 0, t}, i <= t do
+          {i + 1, i, t}
+        end
+
+      last
+    end
+
+    @tag compiler: Evaluator
+    test "underscored vars" do
+      assert while_last(10) == Nx.tensor(10)
+    end
+
+    defn while_generator_sum(tensor) do
+      while acc = tensor[0] * 0, part <- tensor do
+        acc + part
+      end
+    end
+
+    @tag compiler: Evaluator
+    test "tensor generator" do
+      assert while_generator_sum(Nx.tensor([0, 1, 2, 3, 4])) == Nx.tensor(10)
+      assert while_generator_sum(Nx.iota({3, 3})) == Nx.tensor([9, 12, 15])
+    end
+
+    defn while_generator_sum_unroll(tensor) do
+      while acc = 0, part <- tensor, unroll: true do
+        acc + part
+      end
+    end
+
+    test "tensor generator expression exact" do
+      expr = while_generator_sum(Nx.tensor([0, 1, 2, 3, 4]))
+
+      assert inspect(expr) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0                s32[5]
+               b = slice a, [0], [1], [1]   s32[1]
+               c = squeeze b, [0]           s32
+               d = multiply 0, c            s32
+               e = while {0, a, d}          tuple3
+               f = elem e, 2                s32
+             >\
+             """
+
+      %T{
+        data: %Expr{
+          op: :elem,
+          args: [%T{data: %Expr{op: :while, args: [_, arg, _, while_body]}}, 2]
+        }
+      } = expr
+
+      assert inspect(arg) == """
+             {#Nx.Tensor<
+                s32
+              \s\s
+                Nx.Defn.Expr
+                parameter a:0   s32
+              >, #Nx.Tensor<
+                s32[5]
+              \s\s
+                Nx.Defn.Expr
+                parameter a:1   s32[5]
+              >, #Nx.Tensor<
+                s32
+              \s\s
+                Nx.Defn.Expr
+                parameter a:2   s32
+              >}\
+             """
+
+      {counter, param, body} = while_body
+
+      assert inspect(counter) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0   s32
+               b = add 1, a    s32
+             >\
+             """
+
+      assert inspect(param) ==
+               """
+               #Nx.Tensor<
+                 s32[5]
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:1   s32[5]
+               >\
+               """
+
+      assert inspect(body) ==
+               """
+               #Nx.Tensor<
+                 s32
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:2                s32
+                 parameter b:1                s32[5]
+                 parameter c:0                s32
+                 d = slice b, [c], [1], [1]   s32[1]
+                 e = squeeze d, [0]           s32
+                 f = add a, e                 s32
+               >\
+               """
+    end
+
+    test "tensor generator unrolled" do
+      assert while_generator_sum_unroll(Nx.tensor([1, 2, 3])) |> inspect() == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0                s32[3]
+               b = slice a, [0], [1], [1]   s32[1]
+               c = squeeze b, [0]           s32
+               d = slice a, [1], [1], [1]   s32[1]
+               e = squeeze d, [0]           s32
+               f = add c, e                 s32
+               g = slice a, [2], [1], [1]   s32[1]
+               h = squeeze g, [0]           s32
+               i = add f, h                 s32
+             >\
+             """
+    end
+
+    defn while_generator_sum_unroll_int(tensor) do
+      while acc = 0, part <- tensor, unroll: 3 do
+        acc + part
+      end
+    end
+
+    @tag compiler: Evaluator
+    test "tensor generator unrolled integer result" do
+      assert while_generator_sum_unroll_int(Nx.tensor([1, 2, 3])) == Nx.tensor(6)
+      assert while_generator_sum_unroll_int(Nx.tensor([1, 2, 3, 4, 5, 6])) == Nx.tensor(21)
+      assert while_generator_sum_unroll_int(Nx.tensor([1, 2, 3, 4, 5, 6, 7, 8])) == Nx.tensor(36)
+    end
+
+    test "tensor generator unrolled integer expression exact" do
+      expr = while_generator_sum_unroll_int(Nx.tensor([1, 2, 3, 4, 5, 6]))
+
+      assert inspect(expr) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0         s32[6]
+               b = while {0, a, 0}   tuple3
+               c = elem b, 2         s32
+             >\
+             """
+
+      %T{
+        data: %Expr{
+          op: :elem,
+          args: [%T{data: %Expr{op: :while, args: [_, _, _, while_body]}}, 2]
+        }
+      } = expr
+
+      {counter, param, body} = while_body
+
+      assert inspect(counter) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0   s32
+               b = add 3, a    s32
+             >\
+             """
+
+      assert inspect(param) == """
+             #Nx.Tensor<
+               s32[6]
+             \s\s
+               Nx.Defn.Expr
+               parameter a:1   s32[6]
+             >\
+             """
+
+      assert inspect(body) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:2                s32
+               parameter b:1                s32[6]
+               parameter c:0                s32
+               d = slice b, [c], [1], [1]   s32[1]
+               e = squeeze d, [0]           s32
+               f = add a, e                 s32
+               g = add 1, c                 s32
+               h = slice b, [g], [1], [1]   s32[1]
+               i = squeeze h, [0]           s32
+               j = add f, i                 s32
+               k = add 2, c                 s32
+               l = slice b, [k], [1], [1]   s32[1]
+               m = squeeze l, [0]           s32
+               n = add j, m                 s32
+             >\
+             """
+    end
+
+    test "tensor generator unrolled integer expression left-over" do
+      assert while_generator_sum_unroll_int(Nx.tensor([1, 2, 3])) |> inspect() == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0                s32[3]
+               b = slice a, [0], [1], [1]   s32[1]
+               c = squeeze b, [0]           s32
+               d = slice a, [1], [1], [1]   s32[1]
+               e = squeeze d, [0]           s32
+               f = add c, e                 s32
+               g = slice a, [2], [1], [1]   s32[1]
+               h = squeeze g, [0]           s32
+               i = add f, h                 s32
+             >\
+             """
+
+      assert while_generator_sum_unroll_int(Nx.tensor([1, 2, 3, 4, 5, 6, 7, 8])) |> inspect() ==
+               """
+               #Nx.Tensor<
+                 s32
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0                s32[8]
+                 b = while {0, a, 0}          tuple3
+                 c = elem b, 2                s32
+                 d = slice a, [6], [1], [1]   s32[1]
+                 e = squeeze d, [0]           s32
+                 f = add c, e                 s32
+                 g = slice a, [7], [1], [1]   s32[1]
+                 h = squeeze g, [0]           s32
+                 i = add f, h                 s32
+               >\
+               """
+    end
+
+    defn while_generator_range(acc, opts \\ []) do
+      opts = keyword!(opts, [:range, unroll: false])
+
+      while acc, part <- opts[:range], unroll: opts[:unroll] do
+        acc + part
+      end
+    end
+
+    @tag compiler: Evaluator
+    test "range generator" do
+      # Increasing ranges
+      assert while_generator_range(0, range: 0..4) == Nx.tensor(10)
+      assert while_generator_range(100, range: 1..10) == Nx.tensor(155)
+      assert while_generator_range(0, range: 0..4, unroll: true) == Nx.tensor(10)
+      assert while_generator_range(100, range: 1..10, unroll: true) == Nx.tensor(155)
+      assert while_generator_range(0, range: 0..4, unroll: 3) == Nx.tensor(10)
+      assert while_generator_range(100, range: 1..10, unroll: 3) == Nx.tensor(155)
+
+      # Empty ranges
+      assert while_generator_range(0, range: 0..-1//1) == Nx.tensor(0)
+      assert while_generator_range(100, range: 0..-1//1) == Nx.tensor(100)
+      assert while_generator_range(0, range: 0..-1//1, unroll: true) == Nx.tensor(0)
+      assert while_generator_range(100, range: 0..-1//1, unroll: true) == Nx.tensor(100)
+      assert while_generator_range(0, range: 0..-1//1, unroll: 3) == Nx.tensor(0)
+      assert while_generator_range(100, range: 0..-1//1, unroll: 3) == Nx.tensor(100)
+
+      # Decreasing ranges
+      assert while_generator_range(0, range: 4..0//-1) == Nx.tensor(10)
+      assert while_generator_range(100, range: 10..1//-1) == Nx.tensor(155)
+      assert while_generator_range(0, range: 4..0//-1, unroll: true) == Nx.tensor(10)
+      assert while_generator_range(100, range: 10..1//-1, unroll: true) == Nx.tensor(155)
+      assert while_generator_range(0, range: 4..0//-1, unroll: 3) == Nx.tensor(10)
+      assert while_generator_range(100, range: 10..1//-1, unroll: 3) == Nx.tensor(155)
+    end
+
+    test "range generator unrolled" do
+      assert while_generator_range(0, range: 1..3, unroll: true) |> inspect() == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0   s32
+               b = add 6, a    s32
+             >\
+             """
+    end
+
+    test "range generator unrolled integer expression exact" do
+      expr = while_generator_range(0, range: 1..6, unroll: 3)
+
+      assert inspect(expr) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0      s32
+               b = while {1, a}   tuple2
+               c = elem b, 1      s32
+             >\
+             """
+
+      %T{
+        data: %Expr{
+          op: :elem,
+          args: [%T{data: %Expr{op: :while, args: [_, _, _, while_body]}}, 1]
+        }
+      } = expr
+
+      {counter, body} = while_body
+
+      assert inspect(counter) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0   s32
+               b = add 3, a    s32
+             >\
+             """
+
+      assert inspect(body) == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0   s32
+               parameter b:1   s32
+               c = add b, a    s32
+               d = add c, a    s32
+               e = add a, d    s32
+               f = add 1, e    s32
+               g = add 2, f    s32
+             >\
+             """
+    end
+
+    test "range generator unrolled integer expression left-over" do
+      assert while_generator_range(0, range: 1..3, unroll: 3) |> inspect() == """
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0   s32
+               b = add 6, a    s32
+             >\
+             """
+
+      assert while_generator_range(0, range: 1..8, unroll: 3) |> inspect() ==
+               """
+               #Nx.Tensor<
+                 s32
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0      s32
+                 b = while {1, a}   tuple2
+                 c = elem b, 1      s32
+                 d = add 15, c      s32
+               >\
+               """
+
+      assert while_generator_range(0, range: 8..1//-1, unroll: 3) |> inspect() ==
+               """
+               #Nx.Tensor<
+                 s32
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0      s32
+                 b = while {8, a}   tuple2
+                 c = elem b, 1      s32
+                 d = add 3, c       s32
+               >\
+               """
     end
 
     defn while_mixed_return(a, b) do
       while {a, b}, Nx.less(a, 10) do
-        %{a: a, b: b}
+        %{"a" => a, "b" => b}
       end
     end
 
     test "raises on mixed return" do
+      expected_error =
+        [
+          "the do-block in while must return tensors with the same shape, type, and names as the initial arguments.",
+          "\n\n\e\\[32m\n<<<<< Body \\(do-block\\) <<<<<\n%\\{\"a\" => #Nx.Tensor<\n    s32\n  >, \"b\" => #Nx.Tensor<\n    s32\n  >\\}",
+          "\n==========\n\e\\[31m\\{#Nx.Tensor<\n   s32\n >, #Nx.Tensor<\n   s32\n >\\}\n>>>>>     Initial     >>>>>\n\e\\[0m\n$"
+        ]
+        |> IO.iodata_to_binary()
+        |> Regex.compile!()
+
       assert_raise CompileError,
-                   ~r/the do-block in while must return the shape, type, and names as the initial arguments. Got body %\{:a => s64, :b => s64\} and initial \{s64, s64\}/,
+                   expected_error,
                    fn -> while_mixed_return(Nx.tensor(0), Nx.tensor(1)) end
     end
 
@@ -1206,8 +2453,54 @@ defmodule Nx.DefnTest do
 
     test "raises on mixed context" do
       assert_raise RuntimeError,
-                   ~r"cannot build defn because expressions come from different contexts: :root and :while",
+                   ~r"cannot build defn because expressions come from different contexts: :root and {:while, #Reference<[^>]+>}",
                    fn -> while_mixed_context(Nx.tensor(0), Nx.tensor(1)) end
+    end
+
+    defn while_block_mixed_context_lhs(a) do
+      x = a + 1
+
+      while {x, i = 0}, i < 10 do
+        x_next = Nx.LinAlg.solve(a, x)
+        {x_next, i + 1}
+      end
+    end
+
+    defn while_block_mixed_context_rhs(a) do
+      x = a + 1
+
+      while {x, i = 0}, i < 10 do
+        x_next = Nx.LinAlg.solve(x, a)
+        {x_next, i + 1}
+      end
+    end
+
+    test "raises on mixed context when a block captures an outer tensor as the left argument" do
+      a = Nx.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+      assert_raise RuntimeError,
+                   ~r"cannot build defn because expressions come from different contexts: \{:while, #Reference<[^>]+>\} and :root",
+                   fn -> while_block_mixed_context_lhs(a) end
+    end
+
+    test "raises on mixed context when a block captures an outer tensor as the right argument" do
+      a = Nx.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+      assert_raise RuntimeError,
+                   ~r"cannot build defn because expressions come from different contexts: :root and \{:while, #Reference<[^>]+>}",
+                   fn -> while_block_mixed_context_rhs(a) end
+    end
+
+    defn while_condition_opts(a) do
+      while a, Nx.less(a, 10), unroll: true do
+        a + 1
+      end
+    end
+
+    test "raises on options given to condition" do
+      assert_raise CompileError,
+                   ~r"options are not supported on while with conditions, only with generators, got: \[unroll: true\]",
+                   fn -> while_condition_opts(Nx.tensor(0)) end
     end
 
     test "raises if non-variable is given as pattern" do
@@ -1226,7 +2519,7 @@ defmodule Nx.DefnTest do
 
     test "raises if non-block is given" do
       assert_raise ArgumentError,
-                   ~r"expected third argument to \"while\" to be a do-block, got: a \+ 1",
+                   ~r"expected last argument of \"while\" to be a do-block, got: a \+ 1",
                    fn ->
                      defmodule InvalidWhile do
                        defn upto(a) do
@@ -1245,11 +2538,11 @@ defmodule Nx.DefnTest do
 
   describe "transform" do
     defn transform_inspect(a, b) do
-      (Nx.tanh(a) + Nx.power(b, 3)) |> inspect_expr()
+      (Nx.tanh(a) + Nx.pow(b, 3)) |> print_expr()
     end
 
     defn transform_inspect_label(a, b) do
-      (Nx.tanh(a) + Nx.power(b, 3)) |> inspect_expr(label: "HELLO")
+      (Nx.tanh(a) + Nx.pow(b, 3)) |> print_expr(label: "HELLO")
     end
 
     test "executes the transformation" do
@@ -1258,11 +2551,11 @@ defmodule Nx.DefnTest do
                f32
              \s\s
                Nx.Defn.Expr
-               parameter a         s64
-               parameter c         s64
-               b = tanh [ a ]      f32
-               d = power [ c, 3 ]  s64
-               e = add [ b, d ]    f32
+               parameter a:0   s32
+               parameter c:1   s32
+               b = tanh a      f32
+               d = pow c, 3    s32
+               e = add b, d    f32
              >
              """
 
@@ -1271,107 +2564,308 @@ defmodule Nx.DefnTest do
                f32
              \s\s
                Nx.Defn.Expr
-               parameter a         s64
-               parameter c         s64
-               b = tanh [ a ]      f32
-               d = power [ c, 3 ]  s64
-               e = add [ b, d ]    f32
+               parameter a:0   s32
+               parameter c:1   s32
+               b = tanh a      f32
+               d = pow c, 3    s32
+               e = add b, d    f32
              >
              """
     end
 
-    @defn_compiler Evaluator
     defn transform_back_and_forth(a) do
-      Nx.exp(transform(Nx.negate(a), &private_back_and_forth/1))
+      a |> Nx.negate() |> private_back_and_forth() |> Nx.exp()
     end
 
-    defp private_back_and_forth(a) do
+    deftransformp private_back_and_forth(a) do
       Evaluator = Nx.Defn.Compiler.current()
       final_back_and_forth(a)
     end
 
-    defn final_back_and_forth(a), do: Nx.tanh(a)
+    defn(final_back_and_forth(a), do: Nx.tanh(a))
 
+    @tag compiler: Evaluator
     test "back and forth between Elixir and defn" do
       assert transform_back_and_forth(Nx.tensor(1)) ==
                Nx.tensor(1) |> Nx.negate() |> Nx.tanh() |> Nx.exp()
     end
+  end
 
-    @defn_compiler Evaluator
-    defn transform_variable_access(a, b) do
-      transform(:ok, fn :ok -> a + b end)
+  describe "debug expression" do
+    defn(defn_debug(a, b), do: a + b)
+
+    test "debug_expr/2" do
+      assert %Nx.Tensor{data: %Nx.Defn.Expr{op: :add, args: [left, right]}} =
+               Nx.Defn.debug_expr(&defn_debug/2).(1, 2)
+
+      assert %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [0]}} = left
+      assert %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [1]}} = right
     end
 
-    test "supports variable access" do
-      assert transform_variable_access(Nx.tensor(1), Nx.tensor(2)) == Nx.tensor(3)
+    test "debug_expr_apply/3" do
+      assert %Nx.Tensor{data: %Nx.Defn.Expr{op: :add, args: [left, right]}} =
+               Nx.Defn.debug_expr_apply(&defn_debug/2, [1, 2])
+
+      assert %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [0]}} = left
+      assert %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [1]}} = right
     end
   end
 
   describe "jit" do
-    defn defn_jit({a, b}, c), do: a + b - c
+    defn(defn_jit({a, b}, c), do: a + b - c)
 
     test "compiles defn function" do
-      assert Nx.Defn.jit(&defn_jit/2, [{4, 5}, 3]) == Nx.tensor(6)
-      assert Nx.Defn.jit(&defn_jit/2, [{4, 5}, Nx.tensor(3)]) == Nx.tensor(6)
-      assert Nx.Defn.jit(&defn_jit(&1, 3), [{4, 5}]) == Nx.tensor(6)
-
       assert %T{data: %Expr{op: :subtract}} =
-               Nx.Defn.jit(&defn_jit/2, [{1, 2}, 3], compiler: Identity)
+               Nx.Defn.jit(&defn_jit/2, compiler: Debug).({1, 2}, 3)
+
+      Nx.Defn.default_options(compiler: Evaluator)
+      assert Nx.Defn.jit(&defn_jit/2).({4, 5}, 3) == Nx.tensor(6)
+      assert Nx.Defn.jit(&defn_jit/2).({4, 5}, Nx.tensor(3)) == Nx.tensor(6)
+      assert Nx.Defn.jit(&defn_jit(&1, 3)).({4, 5}) == Nx.tensor(6)
     end
 
-    @defn_compiler Evaluator
-    defn defn_jit_or_apply(ab, c), do: Nx.Defn.jit_or_apply(&defn_jit/2, [ab, c])
+    @tag compiler: Evaluator
+    test "applies with options" do
+      fun = Nx.Defn.jit(&Nx.sum/2)
+      assert fun.(Nx.iota({2, 2}), axes: [1]) == Nx.tensor([1, 5])
+    end
+
+    defn(defn_jit_or_apply(ab, c),
+      do: Nx.Defn.jit_apply(&defn_jit/2, [ab, c], on_conflict: :reuse)
+    )
 
     test "jits or applies" do
-      assert Nx.Defn.jit_or_apply(&defn_jit/2, [{4, 5}, 3]) == Nx.tensor(6)
+      assert %T{data: %Expr{op: :subtract}} =
+               Nx.Defn.jit_apply(&defn_jit_or_apply/2, [{1, 2}, 3],
+                 compiler: Debug,
+                 on_conflict: :reuse
+               )
+
+      Nx.Defn.default_options(compiler: Evaluator)
+      assert Nx.Defn.jit_apply(&defn_jit/2, [{4, 5}, 3], on_conflict: :reuse) == Nx.tensor(6)
       assert defn_jit_or_apply({4, 5}, 3) == Nx.tensor(6)
     end
 
     def elixir_jit({a, b}, c) do
-      true = Process.get(Nx.Defn.Compiler) in [Evaluator, Identity]
+      true = Process.get(Nx.Defn.Compiler) in [Evaluator, Debug]
       a |> Nx.add(b) |> Nx.subtract(c)
     end
 
     test "compiles elixir function" do
-      assert Nx.Defn.jit(&elixir_jit/2, [{4, 5}, 3]) == Nx.tensor(6)
-      assert Nx.Defn.jit(&elixir_jit/2, [{4, 5}, Nx.tensor(3)]) == Nx.tensor(6)
-      assert Nx.Defn.jit(&elixir_jit(&1, 3), [{4, 5}]) == Nx.tensor(6)
-
       assert %T{data: %Expr{op: :subtract}} =
-               Nx.Defn.jit(&elixir_jit/2, [{4, 5}, 3], compiler: Identity)
+               Nx.Defn.jit(&elixir_jit/2, compiler: Debug).({4, 5}, 3)
+
+      Nx.Defn.default_options(compiler: Evaluator)
+      assert Nx.Defn.jit(&elixir_jit/2).({4, 5}, 3) == Nx.tensor(6)
+      assert Nx.Defn.jit(&elixir_jit/2).({4, 5}, Nx.tensor(3)) == Nx.tensor(6)
+      assert Nx.Defn.jit(&elixir_jit(&1, 3)).({4, 5}) == Nx.tensor(6)
+    end
+
+    defp elixir_constant_jit() do
+      %Nx.Tensor{data: %Nx.Defn.Expr{}} = Nx.to_tensor(0)
+    end
+
+    test "compiles elixir function with default backend for constants" do
+      assert Nx.Defn.jit(&elixir_constant_jit/0, compiler: Evaluator).() == Nx.tensor(0)
     end
 
     test "raises if it doesn't return an expression" do
-      assert_raise ArgumentError,
-                   "defn must return a tensor expression or a tuple, got: :ok",
-                   fn ->
-                     Nx.Defn.jit(fn -> :ok end, [], compiler: Evaluator).()
-                   end
+      assert_raise Protocol.UndefinedError,
+                   fn -> Nx.Defn.jit(fn -> :ok end, compiler: Evaluator).() end
     end
 
-    defn jit_iota(), do: Nx.iota({3, 3})
+    defn(jit_iota(), do: Nx.iota({3, 3}))
 
     @tag :capture_log
+    @tag compiler: Evaluator
     test "uses the default backend on iota" do
-      Nx.default_backend(UnknownBackend)
-      assert_raise UndefinedFunctionError, fn -> Nx.Defn.jit(&jit_iota/0, []) end
-      assert_raise UndefinedFunctionError, fn -> Nx.Defn.jit(fn -> Nx.iota({3, 3}) end, []) end
+      Nx.default_backend(ProcessBackend)
+      assert_raise RuntimeError, "not supported", fn -> Nx.Defn.jit(&jit_iota/0).() end
+
+      assert_raise RuntimeError, "not supported", fn ->
+        Nx.Defn.jit(fn -> Nx.iota({3, 3}) end).()
+      end
+    end
+
+    defn(nested_jit(opts \\ []), do: nested_jit_transform(opts))
+
+    deftransformp nested_jit_transform(opts) do
+      eleven = Nx.tensor(11, backend: Nx.BinaryBackend)
+      Nx.Defn.jit(&Nx.Defn.Kernel.*/2, opts).(eleven, eleven)
+    end
+
+    @tag compiler: Evaluator
+    test "raises on nested JIT unless forcing" do
+      assert_raise RuntimeError,
+                   "cannot invoke JITed function when there is a JIT compilation happening",
+                   fn -> nested_jit() end
+
+      assert nested_jit(on_conflict: :force) == Nx.tensor(11 * 11)
+    end
+  end
+
+  describe "compile" do
+    defn(defn_compile({a, b}, c), do: a + b - c)
+
+    @tag compiler: Evaluator
+    test "compiles defn function" do
+      fun = Nx.Defn.compile(&defn_compile/2, [{4, 5}, 3])
+      assert fun.({4, 5}, 3) == Nx.tensor(6)
+      assert fun.({40, 50}, 30) == Nx.tensor(60)
+
+      fun = Nx.Defn.compile(&defn_compile(&1, 3), [{4, 5}])
+      assert fun.({4, 5}) == Nx.tensor(6)
+      assert fun.({40, 50}) == Nx.tensor(87)
+    end
+
+    @tag compiler: Evaluator
+    test "compiles defn function with options" do
+      fun = Nx.Defn.compile(&Nx.sum/2, [Nx.template({2, 2}, :s32), [axes: [1]]])
+      assert fun.(Nx.iota({2, 2})) == Nx.tensor([1, 5])
+    end
+
+    @tag compiler: Evaluator
+    test "compiles with vectorized inputs" do
+      fun = Nx.Defn.compile(&Nx.add/2, [Nx.template({2, 2}, :s32) |> Nx.vectorize(:x), 0])
+
+      assert fun.(Nx.iota({2, 2}) |> Nx.vectorize(:x), 1) ==
+               Nx.tensor([[1, 2], [3, 4]]) |> Nx.vectorize(:x)
+
+      fun = fn left, right -> Nx.subtract(right, Nx.add(left, left)) end
+      fun = Nx.Defn.compile(fun, [Nx.template({2, 2}, :s32) |> Nx.vectorize(:x), 0])
+
+      assert fun.(Nx.iota({2, 2}) |> Nx.vectorize(:x), 1) ==
+               Nx.tensor([[1, -1], [-3, -5]]) |> Nx.vectorize(:x)
+    end
+
+    # @tag compiler: Evaluator
+    test "supports broadcast_vectors inside defn" do
+      x = Nx.iota({2, 1, 1}) |> Nx.vectorize(x: 2, y: 1)
+      y = Nx.iota({1, 2, 1}) |> Nx.vectorize(x: 1, y: 2)
+
+      result =
+        Nx.Defn.jit_apply(
+          fn x, y ->
+            [x, y] = Nx.broadcast_vectors([x, y])
+            {x, y}
+          end,
+          [x, y]
+        )
+
+      assert inspect(result) |> String.replace(~r/\s/, "") ==
+               """
+               {#Nx.Tensor<
+               vectorized[x: 2][y: 2]
+               s32[1]
+
+               Nx.Defn.Expr
+               parameter a:0                           s32[2][1][1]
+               b = broadcast a, {2, 2, 1}, [0, 1, 2]   s32[2][2][1]
+               >, #Nx.Tensor<
+               vectorized[x: 2][y: 2]
+               s32[1]
+
+               Nx.Defn.Expr
+               parameter a:1                           s32[1][2][1]
+               b = broadcast a, {2, 2, 1}, [0, 1, 2]   s32[2][2][1]
+               >}
+               """
+               |> String.replace(~r/\s/, "")
+
+      assert Nx.Defn.jit_apply(
+               fn x, y ->
+                 [x, y] = Nx.broadcast_vectors([x, y])
+                 {x, y}
+               end,
+               [x, y],
+               compiler: Evaluator
+             ) == {
+               Nx.tensor([
+                 [
+                   [0],
+                   [0]
+                 ],
+                 [
+                   [1],
+                   [1]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, y: 2),
+               Nx.tensor([
+                 [
+                   [0],
+                   [1]
+                 ],
+                 [
+                   [0],
+                   [1]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, y: 2)
+             }
+    end
+
+    @tag compiler: Evaluator
+    test "raises on incompatible shape" do
+      fun = Nx.Defn.compile(&defn_compile/2, [{4, 5}, 3])
+
+      assert_raise ArgumentError,
+                   ~r"argument at position 1 is not compatible with compiled function template",
+                   fn -> fun.({Nx.iota({4}), 5}, 3) end
+
+      assert_raise ArgumentError,
+                   ~r"cannot invoke compiled function because the given arguments do not match compiled arguments",
+                   fn -> fun.(3, 4) end
+
+      assert_raise ArgumentError,
+                   ~r"cannot invoke compiled function because the given arguments do not match compiled arguments",
+                   fn -> fun.({3, 4, 5}, {6, 7, 8}) end
+    end
+
+    defn(nested_compile(opts \\ []), do: nested_compile_transform(opts))
+
+    deftransformp nested_compile_transform(opts) do
+      eleven = Nx.tensor(11, backend: Nx.BinaryBackend)
+      Nx.Defn.compile(&Nx.Defn.Kernel.*/2, [eleven, eleven], opts).(eleven, eleven)
+    end
+
+    @tag compiler: Evaluator
+    test "raises when nested on JIT" do
+      assert_raise RuntimeError,
+                   "cannot invoke compiled function when there is a JIT compilation happening",
+                   fn -> nested_compile() end
     end
   end
 
   describe "compilation errors" do
-    test "invalid numerical expression" do
-      assert_raise CompileError, ~r"#{location(+5)}: invalid numerical expression", fn ->
-        defmodule Sample do
-          import Nx.Defn
+    test "undefined local function" do
+      assert_raise CompileError,
+                   ~r"#{location(+6)}: undefined function do_add/2 \(there is no such import\)",
+                   fn ->
+                     defmodule Sample do
+                       import Nx.Defn
 
-          defn add(_a, _b) do
-            receive do
-              :ok -> :ok
-            end
-          end
-        end
-      end
+                       defn add(a, b) do
+                         do_add(a, b)
+                       end
+                     end
+                   end
+    end
+
+    test "non-defn local function" do
+      assert_raise CompileError,
+                   ~r"#{location(+6)}: cannot use function do_add/2 inside defn because it was not defined with defn",
+                   fn ->
+                     defmodule Sample do
+                       import Nx.Defn
+
+                       defn add(a, b) do
+                         do_add(a, b)
+                       end
+
+                       defp do_add(a, b), do: a + b
+                     end
+                   end
     end
 
     test "non-variables used as arguments" do
@@ -1380,7 +2874,7 @@ defmodule Nx.DefnTest do
                    fn ->
                      defmodule Sample do
                        import Nx.Defn
-                       defn add(1, 2), do: 3
+                       defn(add(1, 2), do: 3)
                      end
                    end
     end
@@ -1391,7 +2885,7 @@ defmodule Nx.DefnTest do
                    fn ->
                      defmodule Sample do
                        import Nx.Defn
-                       defn add(a, a), do: 3
+                       defn(add(a, a), do: 3)
                      end
                    end
     end
@@ -1402,92 +2896,434 @@ defmodule Nx.DefnTest do
                    fn ->
                      defmodule Sample do
                        import Nx.Defn
-                       defn add(a), do: {b, b} = a
-                     end
-                   end
-    end
-
-    test "invalid defn compiler" do
-      assert_raise ArgumentError,
-                   ~r"expected @defn_compiler/@default_defn_compiler to be an atom or",
-                   fn ->
-                     defmodule Sample do
-                       @defn_compiler "unknown"
-                       import Nx.Defn
-                       defn add(a, b), do: a + b
-                     end
-                   end
-    end
-
-    test "invalid default defn compiler" do
-      assert_raise ArgumentError,
-                   ~r"expected @defn_compiler/@default_defn_compiler to be an atom or",
-                   fn ->
-                     defmodule Sample do
-                       @default_defn_compiler "unknown"
-                       import Nx.Defn
-                       defn add(a, b), do: a + b
+                       defn(add(a), do: {b, b} = a)
                      end
                    end
     end
   end
 
-  @default_defn_compiler Evaluator
-
   describe "default arguments" do
-    defn sum_axis_opts(a, opts \\ []), do: Nx.sum(a, opts)
-    defn local_calls_sum_axis_opts(a), do: sum_axis_opts(a)
-    defn remote_calls_sum_axis_opts(a), do: __MODULE__.sum_axis_opts(a)
+    defn(id_default(empty \\ {}), do: empty)
+    defn(sum_axis_opts(a, opts \\ []), do: Nx.sum(a, opts))
+    defn(local_calls_sum_axis_opts(a), do: sum_axis_opts(a))
+    defn(remote_calls_sum_axis_opts(a), do: __MODULE__.sum_axis_opts(a))
 
+    @tag compiler: Evaluator
     test "are supported" do
       assert sum_axis_opts(Nx.tensor([[1, 2], [3, 4]])) == Nx.tensor(10)
       assert sum_axis_opts(Nx.tensor([[1, 2], [3, 4]]), axes: [0]) == Nx.tensor([4, 6])
       assert sum_axis_opts(Nx.tensor([[1, 2], [3, 4]]), axes: [1]) == Nx.tensor([3, 7])
     end
 
+    @tag compiler: Evaluator
+    test "accept any valid defn value" do
+      assert id_default() == {}
+      assert id_default(1) == Nx.tensor(1)
+      assert id_default({1}) == {Nx.tensor(1)}
+    end
+
+    @tag compiler: Evaluator
     test "can be called within defn" do
       assert local_calls_sum_axis_opts(Nx.tensor([[1, 2], [3, 4]])) == Nx.tensor(10)
       assert remote_calls_sum_axis_opts(Nx.tensor([[1, 2], [3, 4]])) == Nx.tensor(10)
     end
 
-    defn random_opts(opts \\ []), do: Nx.random_uniform({}, 0, 1, opts)
+    defn(iota_opts(opts \\ []), do: Nx.iota({1}, opts))
 
+    @tag compiler: Evaluator
     test "exclusively" do
-      assert random_opts([]).type == {:s, 64}
-      assert random_opts(type: {:f, 64}).type == {:f, 64}
+      assert iota_opts([]).type == {:s, 32}
+      assert iota_opts(type: {:f, 64}).type == {:f, 64}
     end
 
-    @defn_compiler Identity
-    defn sum_axis_expr(a, opts \\ []), do: Nx.sum(a, opts)
+    defn(sum_axis_expr(a, opts \\ []), do: Nx.sum(a, opts))
 
     test "have their own cache key" do
       sum_axis_expr(Nx.tensor([[1, 2], [3, 4]]), axes: [0])
-      key0 = Process.get(Identity)
+      key0 = Process.get(Debug)
       assert is_function(key0, 1)
 
       sum_axis_expr(Nx.tensor([[1, 2], [3, 4]]), axes: [1])
-      key1 = Process.get(Identity)
+      key1 = Process.get(Debug)
       assert is_function(key1, 1)
 
       sum_axis_expr(Nx.tensor([[1, 2], [3, 4]]), axes: [0])
-      assert Process.get(Identity) == key0
+      assert Process.get(Debug) == key0
     end
   end
 
   describe "private definitions" do
-    defnp private(a, b), do: a + b
-    defn calls_private(a, b), do: private(a, b)
+    defnp(private(a, b), do: a + b)
+    defn(calls_private(a, b), do: private(a, b))
 
+    @tag compiler: Evaluator
     test "are supported" do
       assert private(1, 2) == Nx.tensor(3)
     end
 
+    @tag compiler: Evaluator
     test "are not exported" do
       refute function_exported?(__MODULE__, :private, 2)
     end
 
+    @tag compiler: Evaluator
     test "are callable from defn" do
       assert calls_private(1, 2) == Nx.tensor(3)
+    end
+
+    test "warns when unused" do
+      assert ExUnit.CaptureIO.capture_io(:stderr, fn ->
+               defmodule Example do
+                 import Nx.Defn
+                 defnp(add(a, b), do: a + b)
+               end
+             end) =~ "function add/2 is unused"
+    end
+  end
+
+  describe "deftransform" do
+    defn deftransform_test(a, b, opts \\ []) do
+      {c, d} = deftransform_test_transformation(opts)
+
+      deftransform_test_send(c)
+      deftransform_test_send(d)
+
+      x = a + c
+      y = b + d
+
+      x * y
+    end
+
+    deftransform deftransform_test_transformation(opts) do
+      b = opts[:b] || raise "missing :b"
+      c = opts[:c] || raise "missing :c"
+      {b, c}
+    end
+
+    deftransformp deftransform_test_send(value) do
+      send(self(), {:deftransform, value})
+    end
+
+    defn default_args1(x) do
+      default_args(x)
+    end
+
+    defn default_args2(x, y) do
+      default_args(x, y)
+    end
+
+    defn default_args3(x, y, z) do
+      default_args(x, y, z)
+    end
+
+    defn(public_default_args1(x), do: public_default_args(x))
+    defn(public_default_args2(x, y), do: public_default_args(x, y))
+
+    # Ensure that defp works with defaults
+    deftransformp default_args(arg1 \\ 1, arg2, arg3 \\ 3) do
+      {arg1, arg2, arg3}
+    end
+
+    # Ensure that def works
+    deftransform(public_default_args(arg1, arg2 \\ 2), do: {arg1, arg2})
+
+    # Ensure multi-clause and guards work
+    deftransform multi_clause_transform(number, fun) when is_function(fun, 1) do
+      fun.(number)
+    end
+
+    deftransform multi_clause_transform(x, y) when is_number(x) and is_number(y) and y > 0 do
+      x ** y
+    end
+
+    defn(multi_clause_first(x), do: multi_clause_transform(x, &(&1 + &1)))
+    defn(multi_clause_second(opts \\ []), do: multi_clause_transform(opts[:x], opts[:y]))
+
+    deftransform(multi_clause_bodiless_tf(x \\ 1, y))
+    deftransform(multi_clause_bodiless_tf(1, y), do: y)
+    deftransform(multi_clause_bodiless_tf(x, _y), do: x)
+
+    defn(multi_clause_transform_bodiless1(a), do: multi_clause_bodiless_tf(a))
+
+    defn(multi_clause_transform_bodiless2(opts \\ []),
+      do: multi_clause_bodiless_tf(opts[:a], opts[:b])
+    )
+
+    deftransformp(multi_clause_bodiless_tf_private(x \\ 1, y))
+    deftransformp(multi_clause_bodiless_tf_private(1, y), do: y)
+    deftransformp(multi_clause_bodiless_tf_private(x, _y), do: x)
+
+    defn(multi_clause_transform_bodiless3(a), do: multi_clause_bodiless_tf_private(a))
+
+    defn(multi_clause_transform_bodiless4(opts \\ []),
+      do: multi_clause_bodiless_tf_private(opts[:a], opts[:b])
+    )
+
+    # Multi-clause deftransform with guards
+    deftransform(multi_clause_multi_arity_transform(x, y \\ 10, z \\ 20))
+
+    deftransform(multi_clause_multi_arity_transform(x, y, opts) when is_list(opts),
+      do: {x, y, opts[:value]}
+    )
+
+    deftransform(multi_clause_multi_arity_transform(x, y, w), do: {x, y, w})
+
+    deftransform(multi_clause_multi_arity_transform(x, y, w, opts), do: {x, y, w, opts[:value]})
+
+    defmodule RemoteTransform do
+      import Nx.Defn
+
+      deftransform(remote_with_defaults(x, y \\ 0), do: Nx.add(x, y))
+    end
+
+    defn(call_remote_transform_1(x), do: RemoteTransform.remote_with_defaults(x))
+    defn(call_remote_transform_2(x), do: RemoteTransform.remote_with_defaults(x, x + 1))
+
+    @tag compiler: Evaluator
+    test "can call remote deftransform with defaults from within defn" do
+      assert Nx.tensor(1) == call_remote_transform_1(1)
+      assert Nx.tensor(3) == call_remote_transform_2(1)
+    end
+
+    test "can call deftransform and deftransformp functions from within defn" do
+      result = deftransform_test(Nx.tensor(1), Nx.tensor(2), b: 3, c: 4)
+
+      assert String.trim("""
+             #Nx.Tensor<
+               s32
+             \s\s
+               Nx.Defn.Expr
+               parameter a:0       s32
+               parameter c:1       s32
+               b = add 3, a        s32
+               d = add 4, c        s32
+               e = multiply b, d   s32
+             >
+             """) == inspect(result)
+
+      assert_received {:deftransform, 3}
+      assert_received {:deftransform, 4}
+    end
+
+    @tag compiler: Evaluator
+    test "deftransformp handles default arguments" do
+      assert default_args1(20) == {Nx.tensor(1), Nx.tensor(20), Nx.tensor(3)}
+      assert default_args2(10, 20) == {Nx.tensor(10), Nx.tensor(20), Nx.tensor(3)}
+      assert default_args3(10, 20, 30) == {Nx.tensor(10), Nx.tensor(20), Nx.tensor(30)}
+    end
+
+    @tag compiler: Evaluator
+    test "deftransform handles default arguments" do
+      assert public_default_args1(10) == {Nx.tensor(10), Nx.tensor(2)}
+      assert public_default_args2(10, 20) == {Nx.tensor(10), Nx.tensor(20)}
+    end
+
+    @tag compiler: Evaluator
+    test "multi-clause and guards work for deftransform" do
+      assert multi_clause_first(2) == Nx.tensor(4)
+      assert multi_clause_second(x: 2, y: 3) == Nx.tensor(8)
+    end
+
+    test "multi-clause raises for no clause matching args" do
+      assert_raise FunctionClauseError,
+                   "no function clause matching in Nx.DefnTest.multi_clause_transform/2",
+                   fn ->
+                     multi_clause_second(x: 2, y: -3)
+                   end
+    end
+
+    @tag compiler: Evaluator
+    test "multi-clause deftransform and deftransformp with bodiless head" do
+      assert Nx.tensor(10) == multi_clause_transform_bodiless1(10)
+      assert Nx.tensor(10) == multi_clause_transform_bodiless2(a: 1, b: 10)
+      assert Nx.tensor(20) == multi_clause_transform_bodiless2(a: 20, b: 10)
+
+      assert Nx.tensor(10) == multi_clause_transform_bodiless3(10)
+      assert Nx.tensor(10) == multi_clause_transform_bodiless4(a: 1, b: 10)
+      assert Nx.tensor(20) == multi_clause_transform_bodiless4(a: 20, b: 10)
+    end
+  end
+
+  describe "boolean values" do
+    defn supports_booleans(opts \\ []) do
+      l = opts[:l]
+      r = opts[:r]
+
+      Nx.stack([l < r, l <= r, l > r, l >= r, l == r, l != r, l and r, l or r, not l, not r])
+    end
+
+    @tag compiler: Evaluator
+    test "supports booleans in some operations" do
+      for l <- [true, false, 1, 0], r <- [true, false, 1, 0] do
+        lb = l == 1 or l == true
+        rb = r == 1 or r == true
+
+        ln = if lb, do: 1, else: 0
+        rn = if rb, do: 1, else: 0
+
+        assert supports_booleans(l: l, r: r) ==
+                 Nx.tensor([
+                   ln < rn,
+                   ln <= rn,
+                   ln > rn,
+                   ln >= rn,
+                   ln == rn,
+                   ln != rn,
+                   lb and rb,
+                   lb or rb,
+                   not lb,
+                   not rb
+                 ])
+      end
+    end
+
+    @tag compiler: Evaluator
+    test "deftransform supports multi-clause + multi-arity at the same time" do
+      assert multi_clause_multi_arity_transform(1) == {1, 10, 20}
+      assert multi_clause_multi_arity_transform(1, 2) == {1, 2, 20}
+      assert multi_clause_multi_arity_transform(1, 2, 3) == {1, 2, 3}
+      assert multi_clause_multi_arity_transform(1, 2, value: 4) == {1, 2, 4}
+      assert multi_clause_multi_arity_transform(1, 2, 3, value: 4) == {1, 2, 3, 4}
+    end
+  end
+
+  describe "metadata" do
+    defn vectorized_metadata(x, y) do
+      stop_grad(x) + y
+    end
+
+    defn vectorized_metadata_tuple(x, y) do
+      {x, y} = stop_grad({x, y})
+      x + y
+    end
+
+    test "supports vectorization" do
+      x = Nx.iota({2}, vectorized_axes: [x: 1, y: 2])
+      y = Nx.iota({2}, vectorized_axes: [x: 2, y: 1])
+      z = Nx.tensor([1])
+
+      # 2 vectorized inputs
+      assert inspect(vectorized_metadata(x, y)) ==
+               String.trim("""
+               #Nx.Tensor<
+                 vectorized[x: 2][y: 2]
+                 s32[2]
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0                s32[1][2][2]
+                 parameter c:1                s32[2][1][2]
+                 b = metadata a, :stop_grad   s32[1][2][2]
+                 d = add b, c                 s32[2][2][2]
+               >
+               """)
+
+      assert inspect(vectorized_metadata_tuple(x, y)) ==
+               String.trim("""
+               #Nx.Tensor<
+                 vectorized[x: 2][y: 2]
+                 s32[2]
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0                     s32[1][2][2]
+                 parameter b:1                     s32[2][1][2]
+                 c = metadata {a, b}, :stop_grad   tuple2
+                 d = elem c, 0                     s32[1][2][2]
+                 e = elem c, 1                     s32[2][1][2]
+                 f = add d, e                      s32[2][2][2]
+               >
+               """)
+
+      # vectorized + non vectorized
+      assert inspect(vectorized_metadata(x, z)) ==
+               String.trim("""
+               #Nx.Tensor<
+                 vectorized[x: 1][y: 2]
+                 s32[2]
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0                s32[1][2][2]
+                 parameter c:1                s32[1]
+                 b = metadata a, :stop_grad   s32[1][2][2]
+                 d = reshape c                s32[1][1][1]
+                 e = add b, d                 s32[1][2][2]
+               >
+               """)
+
+      assert inspect(vectorized_metadata_tuple(x, z)) ==
+               String.trim("""
+               #Nx.Tensor<
+                 vectorized[x: 1][y: 2]
+                 s32[2]
+               \s\s
+                 Nx.Defn.Expr
+                 parameter a:0                     s32[1][2][2]
+                 parameter b:1                     s32[1]
+                 c = metadata {a, b}, :stop_grad   tuple2
+                 d = elem c, 0                     s32[1][2][2]
+                 e = elem c, 1                     s32[1]
+                 f = reshape e                     s32[1][1][1]
+                 g = add d, f                      s32[1][2][2]
+               >
+               """)
+
+      Nx.Defn.default_options(compiler: Nx.Defn.Evaluator)
+
+      # 2 vectorized inputs
+
+      vectorized_result =
+        Nx.tensor([
+          [
+            [0, 2],
+            [0, 2]
+          ],
+          [
+            [0, 2],
+            [0, 2]
+          ]
+        ])
+        |> Nx.vectorize(x: 2, y: 2)
+
+      assert vectorized_metadata(x, y) == vectorized_result
+      assert vectorized_metadata_tuple(x, y) == vectorized_result
+
+      # vectorized + non vectorized
+
+      vec_nonvec_result =
+        Nx.tensor([
+          [
+            [1, 2],
+            [1, 2]
+          ]
+        ])
+        |> Nx.vectorize(x: 1, y: 2)
+
+      assert vectorized_metadata(x, z) == vec_nonvec_result
+      assert vectorized_metadata_tuple(x, z) == vec_nonvec_result
+    end
+  end
+
+  describe "multi-tensor ops with captured closure tensors" do
+    @describetag compiler: Evaluator
+
+    test "put_slice in a jit closure over a concrete target" do
+      t = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+      jitted = Nx.Defn.jit(fn p -> Nx.put_slice(t, [1], p) end)
+
+      assert jitted.(Nx.tensor([10.0, 20.0])) == Nx.tensor([1.0, 10.0, 20.0, 4.0, 5.0])
+    end
+
+    test "clip in a jit closure over a concrete target" do
+      t = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+      jitted = Nx.Defn.jit(fn lo -> Nx.clip(t, lo, 10.0) end)
+
+      assert jitted.(Nx.tensor(1.5)) == Nx.tensor([1.5, 2.0, 3.0, 4.0, 5.0])
+    end
+
+    test "gather in a jit closure over a concrete source" do
+      t = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+      jitted = Nx.Defn.jit(fn idx -> Nx.gather(t, Nx.reshape(idx, {3, 1})) end)
+
+      assert jitted.(Nx.tensor([0, 2, 4], type: :s32)) == Nx.tensor([1.0, 3.0, 5.0])
     end
   end
 end

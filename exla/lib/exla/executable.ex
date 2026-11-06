@@ -4,80 +4,241 @@ defmodule EXLA.Executable do
   """
 
   alias __MODULE__
-  alias EXLA.{Buffer, Shape}
+  alias EXLA.{BinaryBuffer, DeviceBuffer}
+  alias EXLA.Typespec
 
-  @enforce_keys [:client, :ref, :output_shape, :num_replicas, :num_partitions]
-  defstruct [:client, :ref, :output_shape, :num_replicas, :num_partitions, :device_id]
+  @enforce_keys [:client, :ref, :output_typespecs, :num_replicas, :num_partitions, :device_id]
+  defstruct [
+    :client,
+    :ref,
+    :output_typespecs,
+    :num_replicas,
+    :num_partitions,
+    :device_id,
+    :mesh,
+    :input_shardings
+  ]
 
   @doc """
-  Runs the given executable with arguments.
+  Runs the given executable with a list of lists as inputs and the given options.
 
-  ## Options
-
-    * `:keep_on_device` - if the data should be kept on the device
-      after the computation (defaults to `false`).
-
-    * `:device_id` - the device ID to run on
-
+  Returns `{:ok, results}` or `{:error, message}`. Works across nodes.
   """
-  def run(%Executable{} = executable, arguments, options \\ []) do
-    %{client: client, output_shape: output_shape} = executable
-    {data, _} = run(client, executable, arguments, options)
-    decompose_output(data, output_shape, client)
+  def run(executable, inputs, options \\ [])
+
+  def run(%Executable{ref: ref, client: client} = executable, inputs, options)
+      when node(ref) != node() do
+    client
+    |> load(dump(executable))
+    |> run(inputs, options)
   end
 
-  defp run(client, executable, arguments, options) do
-    %{ref: exec} = executable
+  def run(%Executable{} = executable, [subinputs | _] = inputs, options)
+      when is_list(subinputs) do
+    %{
+      client: client,
+      device_id: device_id,
+      output_typespecs: output_typespecs,
+      ref: ref,
+      mesh: mesh
+    } =
+      executable
 
-    keep_on_device = Keyword.get(options, :keep_on_device, false)
-    keep_on_device_int = if keep_on_device, do: 1, else: 0
+    callback_server_pid = Keyword.get(options, :callback_server_pid)
+    inputs = prepare_runtime_callback_inputs(inputs, callback_server_pid)
+
+    case run(client, ref, device_id, inputs, options) do
+      {:error, message} ->
+        {:error, IO.iodata_to_binary(message)}
+
+      results ->
+        {:ok,
+         for data_and_device_id <- results do
+           decompose_output(data_and_device_id, output_typespecs, client, mesh)
+         end}
+    end
+  end
+
+  # callback_server_pid_size is generally 8 bytes,
+  # but we expose these functions so that we don't
+  # hardcode the size in the codebase and are
+  # more future-proof.
+  def callback_server_pid_size do
+    EXLA.NIF.callback_server_pid_size()
+  end
+
+  def callback_server_pid_typespec do
+    Typespec.tensor({:u, 8}, {callback_server_pid_size()})
+  end
+
+  @doc """
+  Dumps the executable to a data structure that can be serialized
+  with `term_to_binary`.
+
+  Works across nodes.
+  """
+  # If you change this function, you must bump the version in EXLA.Defn.Disk.
+  def dump(%Executable{
+        ref: ref,
+        output_typespecs: output_typespecs,
+        num_replicas: num_replicas,
+        num_partitions: num_partitions,
+        device_id: device_id,
+        mesh: mesh,
+        input_shardings: input_shardings
+      })
+      when node(ref) == node() do
+    serialized_exec =
+      ref
+      |> EXLA.NIF.serialize_executable()
+      |> IO.iodata_to_binary()
+
+    %{
+      serialized: serialized_exec,
+      output_typespecs: output_typespecs,
+      num_replicas: num_replicas,
+      num_partitions: num_partitions,
+      device_id: device_id,
+      mesh: mesh,
+      input_shardings: input_shardings
+    }
+  end
+
+  def dump(%Executable{ref: ref} = executable) do
+    :erpc.call(node(ref), __MODULE__, :dump, [executable])
+  end
+
+  @doc """
+  Returns the memory the compiled executable needs, in bytes, as reported
+  by the runtime after buffer assignment. The `:temp_size_in_bytes` entry is
+  the peak scratch memory of the program, excluding arguments and outputs.
+  """
+  def memory_stats(%Executable{ref: ref}) do
+    EXLA.NIF.get_compiled_memory_stats(ref)
+  end
+
+  @doc """
+  Returns the optimized HLO of the compiled executable as text.
+  """
+  def optimized_hlo(%Executable{ref: ref}) do
+    EXLA.NIF.get_optimized_hlo(ref)
+  end
+
+  @doc """
+  Returns the runtime estimate of what the compiled executable costs.
+
+  The keys are the names the runtime uses, such as `"flops"`,
+  `"transcendentals"` and `"bytes accessed"`, with a breakdown per
+  argument and output. The values are estimates made from the optimized
+  program, not measurements.
+  """
+  def cost_analysis(%Executable{ref: ref}) do
+    EXLA.NIF.get_cost_analysis(ref)
+  end
+
+  @doc """
+  Loads a previously dumped executable.
+  """
+  def load(client, data) do
+    %{
+      serialized: serialized,
+      output_typespecs: output_typespecs,
+      num_replicas: num_replicas,
+      num_partitions: num_partitions,
+      device_id: device_id
+    } = data
+
+    ref = EXLA.NIF.deserialize_executable(client.ref, serialized)
+
+    %EXLA.Executable{
+      output_typespecs: output_typespecs,
+      num_replicas: num_replicas,
+      num_partitions: num_partitions,
+      device_id: device_id,
+      mesh: Map.get(data, :mesh),
+      input_shardings: Map.get(data, :input_shardings),
+      ref: ref,
+      client: client
+    }
+  end
+
+  defp run(client, ref, device_id, inputs, options) do
+    callback_server_pid = Keyword.get(options, :callback_server_pid)
 
     inputs =
-      Enum.map(arguments, fn
-        %Buffer{ref: {ref, _}, data: nil} ->
-          ref
+      for subinputs <- inputs do
+        Enum.map(subinputs, fn
+          %DeviceBuffer{ref: ref} ->
+            ref
 
-        %Buffer{data: data, shape: shape, ref: nil} ->
-          {data, shape.ref}
-      end)
-
-    data =
-      case client.platform do
-        :host ->
-          EXLA.NIF.run_cpu(
-            client.ref,
-            exec,
-            inputs,
-            keep_on_device_int,
-            executable.device_id
-          )
-
-        _ ->
-          EXLA.NIF.run_io(
-            client.ref,
-            exec,
-            inputs,
-            keep_on_device_int,
-            executable.device_id
-          )
+          %BinaryBuffer{data: data, typespec: typespec} ->
+            {data, typespec}
+        end)
       end
 
-    unwrap!(data)
+    case client.platform do
+      :host -> EXLA.NIF.run_cpu(ref, inputs, device_id, callback_server_pid)
+      _ -> EXLA.NIF.run_io(ref, inputs, device_id, callback_server_pid)
+    end
   end
 
-  defp decompose_output(data, shape, client) do
-    %Shape{dtype: {:t, shapes}} = shape
+  defp decompose_output({data, device_id}, output_typespecs, client, mesh) do
+    Enum.zip_with(data, output_typespecs, fn
+      buf, logical_typespec when is_reference(buf) ->
+        # Query the actual shape from the buffer only in sharded execution
+        typespec =
+          if mesh != nil do
+            EXLA.NIF.get_buffer_typespec(buf)
+          else
+            logical_typespec
+          end
 
-    Enum.zip_with(data, shapes, fn
-      buf, subshape when is_reference(buf) ->
-        Buffer.buffer({buf, client.name}, subshape)
+        DeviceBuffer.from_ref(buf, client, device_id, typespec)
 
-      buf, subshape ->
-        Buffer.buffer(buf, subshape)
+      buf, typespec when is_binary(buf) ->
+        # Binary buffers use the provided typespec
+        BinaryBuffer.from_binary(buf, typespec)
     end)
   end
 
-  defp unwrap!(:ok), do: :ok
-  defp unwrap!({:ok, ref}), do: ref
-  defp unwrap!({:error, error}), do: raise(List.to_string(error))
+  defp prepare_runtime_callback_inputs(inputs, nil) do
+    callback_server_pid_buffer =
+      callback_server_pid_buffer(<<0::size(callback_server_pid_size())-unit(8)>>)
+
+    Enum.map(inputs, fn replica_inputs ->
+      [callback_server_pid_buffer | replica_inputs]
+    end)
+  end
+
+  defp prepare_runtime_callback_inputs(inputs, callback_server_pid) do
+    callback_server_pid_buffer =
+      callback_server_pid
+      |> encode_callback_server_pid!()
+      |> callback_server_pid_buffer()
+
+    Enum.map(inputs, fn replica_inputs ->
+      [callback_server_pid_buffer | replica_inputs]
+    end)
+  end
+
+  defp encode_callback_server_pid!(callback_server_pid) do
+    callback_server_pid_bin = EXLA.NIF.encode_local_pid(callback_server_pid)
+    callback_server_pid_size = callback_server_pid_size()
+
+    case byte_size(callback_server_pid_bin) do
+      ^callback_server_pid_size ->
+        callback_server_pid_bin
+
+      size ->
+        raise ArgumentError,
+              "expected encoded callback server pid size to be #{callback_server_pid_size} bytes, got #{size}"
+    end
+  end
+
+  defp callback_server_pid_buffer(callback_server_pid_bin) do
+    BinaryBuffer.from_binary(
+      callback_server_pid_bin,
+      callback_server_pid_typespec()
+    )
+  end
 end

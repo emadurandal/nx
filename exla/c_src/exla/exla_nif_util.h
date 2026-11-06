@@ -1,371 +1,430 @@
 #ifndef EXLA_NIF_UTIL_H_
 #define EXLA_NIF_UTIL_H_
 
-#include <complex>
-#include <vector>
-#include <string>
-#include <memory>
-#include <utility>
-#include <map>
+#include <fine.hpp>
+#include <tuple>
 
-#include "erl_nif.h"
-#include "tensorflow/compiler/xla/xla_data.pb.h"
-#include "tensorflow/compiler/xla/types.h"
-#include "tensorflow/compiler/xla/shape.h"
-
-#if !defined(__GNUC__) && (defined(__WIN32__) || defined(_WIN32) || defined(_WIN32_))
-  typedef unsigned __int64 nif_uint64_t;
-  typedef signed __int64 nif_int64_t;
-#else
-  typedef unsigned long nif_uint64_t;
-  typedef signed long nif_int64_t;
-#endif
-
-// Implementation Notes:
-//
-// In most of these implementations you'll find we prefer output parameters
-// over returning values. This follows the convention of the Erlang NIF
-// API in which functions for retrieving terms from the VM return an
-// integer status and populate an output parameter.
-//
-// We also follow the naming convention set forth in the the Erlang NIF
-// API. Numeric, standard, and resource types use the polymorphic/template
-// `get` or `make`.
-//
-// We mostly use vectors for containers (lists and tuples), and maps for
-// returning maps back to the VM. These have suffixes to avoid conflicting
-// signatures for retrieving/returning different signatures.
-//
-// We create separate methods for each XLA protobuf type, so we can guarantee
-// the format we receive the protobuf in is correct.
+#include "mlir/IR/Types.h"
+#include "stablehlo/dialect/StablehloOps.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
 
 namespace exla {
 
-// We standardize numeric types with tensorflow to ensure we are always
-// getting an input with the correct width and to ensure that tensorflow
-// is happy with what we're giving it.
-//
-// Most of these types will only ever be used when creating scalar constants;
-// however, some methods require a 64-bit integer. You should prefer standard
-// types over these unless you are (1) working with computations, or
-// (2) require a non-standard width numeric type (like 64-bit integer).
-using int8 = tensorflow::int8;
-using int16 = tensorflow::int16;
-using int32 = tensorflow::int32;
-using int64 = tensorflow::int64;
-using uint8 = tensorflow::uint8;
-using uint16 = tensorflow::uint16;
-using uint32 = tensorflow::uint32;
-using uint64 = tensorflow::uint64;
-using float16 = Eigen::half;
-using bfloat16 = tensorflow::bfloat16;
-using float32 = float;
-using float64 = double;
-using complex64 = std::complex<float>;
-using complex128 = std::complex<double>;
+namespace atoms {
+static auto ElixirEXLATypespec = fine::Atom("Elixir.EXLA.Typespec");
+static auto __struct__ = fine::Atom("__struct__");
+static auto already_deallocated = fine::Atom("already_deallocated");
+static auto bf = fine::Atom("bf");
+static auto c = fine::Atom("c");
+static auto error = fine::Atom("error");
+static auto f = fine::Atom("f");
+static auto f8_e4m3fn = fine::Atom("f8_e4m3fn");
+static auto info = fine::Atom("info");
+static auto pred = fine::Atom("pred");
+static auto s = fine::Atom("s");
+static auto shape = fine::Atom("shape");
+static auto token = fine::Atom("token");
+static auto type = fine::Atom("type");
+static auto u = fine::Atom("u");
+static auto warning = fine::Atom("warning");
+static auto stop = fine::Atom("stop");
+static auto not_implemented = fine::Atom("not_implemented");
+} // namespace atoms
+} // namespace exla
 
-namespace nif {
+namespace fine {
 
-// Status helpers
+// Define decoding for xla::Shape from for %EXLA.Typespec{} term
+template <> struct Decoder<xla::Shape> {
+  static DecodeResult<xla::Shape> try_decode(ErlNifEnv *env,
+                                             const ERL_NIF_TERM &term) {
+    ERL_NIF_TERM type_term;
+    ERL_NIF_TERM shape_term;
 
-// Helper for returning `{:error, msg}` from NIF.
-ERL_NIF_TERM error(ErlNifEnv* env, const char* msg);
+    if (!enif_get_map_value(env, term, fine::encode(env, exla::atoms::type),
+                            &type_term)) {
+      return DecodeError("decode failed, expected EXLA.Typespec struct", term);
+    }
 
-// Helper for returning `{:ok, term}` from NIF.
-ERL_NIF_TERM ok(ErlNifEnv* env, ERL_NIF_TERM term);
+    if (!enif_get_map_value(env, term, fine::encode(env, exla::atoms::shape),
+                            &shape_term)) {
+      return DecodeError("decode failed, expected EXLA.Typespec struct", term);
+    }
 
-// Helper for returning `:ok` from NIF.
-ERL_NIF_TERM ok(ErlNifEnv* env);
+    auto type = decode_type(env, type_term);
+    if (!type) {
+      return std::move(type).error();
+    }
 
-// Numeric types
-//
-// Floating/Complex types will never get used, except
-// when defining scalar-constants with `constant_r0`.
+    auto shape = decode_shape(env, shape_term);
+    if (!shape) {
+      return std::move(shape).error();
+    }
 
-int get(ErlNifEnv* env, ERL_NIF_TERM term, int8* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, int16* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, int32* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, int64* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, uint8* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, uint16* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, uint32* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, uint64* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, bfloat16* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, float32* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, float64* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, complex64* var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, complex128* var);
+    return xla::ShapeUtil::MakeShape(type.value(), shape.value());
+  }
 
-ERL_NIF_TERM make(ErlNifEnv* env, int32 var);
+private:
+  static DecodeResult<std::vector<int64_t>>
+  decode_shape(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    int size;
+    const ERL_NIF_TERM *terms;
 
-// Standard types
-//
-// We only define implementations for types we use in the
-// NIF.
+    if (!enif_get_tuple(env, term, &size, &terms)) {
+      return DecodeError("decode failed, expected shape to be a tuple", term);
+    }
 
-int get(ErlNifEnv* env, ERL_NIF_TERM term, std::string &var);
-int get(ErlNifEnv* env, ERL_NIF_TERM term, bool* var);
+    auto vector = std::vector<int64_t>();
+    vector.reserve(size);
 
-ERL_NIF_TERM make(ErlNifEnv* env, std::string var);
-ERL_NIF_TERM make(ErlNifEnv* env, ErlNifBinary var);
-ERL_NIF_TERM make(ErlNifEnv* env, const char* string);
+    for (auto i = 0; i < size; i++) {
+      auto elem = fine::try_decode<int64_t>(env, terms[i]);
+      if (!elem) {
+        return std::move(elem).error();
+      }
+      vector.push_back(elem.value());
+    }
 
-// Atoms
-//
-// We have to be explicit in naming these functions because
-// their signatures are the same for retrieving/returning
-// regular strings.
+    return vector;
+  }
 
-int get_atom(ErlNifEnv* env, ERL_NIF_TERM term, std::string* var);
+  static DecodeResult<xla::PrimitiveType> decode_type(ErlNifEnv *env,
+                                                     const ERL_NIF_TERM &term) {
+    auto result = fine::try_decode<std::tuple<fine::Atom, uint64_t>>(env, term);
+    if (!result) {
+      return std::move(result).error();
+    }
+    auto &[element, size] = result.value();
 
-ERL_NIF_TERM atom(ErlNifEnv* env, const char* status);
+    if (element == "u") {
+      switch (size) {
+      case 2:
+        return xla::U2;
+      case 4:
+        return xla::U4;
+      case 8:
+        return xla::U8;
+      case 16:
+        return xla::U16;
+      case 32:
+        return xla::U32;
+      case 64:
+        return xla::U64;
+      }
+    }
+    if (element == "s") {
+      switch (size) {
+      case 2:
+        return xla::S2;
+      case 4:
+        return xla::S4;
+      case 8:
+        return xla::S8;
+      case 16:
+        return xla::S16;
+      case 32:
+        return xla::S32;
+      case 64:
+        return xla::S64;
+      }
+    }
+    if (element == "f") {
+      switch (size) {
+      case 8:
+        return xla::F8E5M2;
+      case 16:
+        return xla::F16;
+      case 32:
+        return xla::F32;
+      case 64:
+        return xla::F64;
+      }
+    }
+    if (element == "f8_e4m3fn") {
+      return xla::F8E4M3FN;
+    }
+    if (element == "bf") {
+      switch (size) {
+      case 16:
+        return xla::BF16;
+      }
+    }
+    if (element == "c") {
+      switch (size) {
+      case 64:
+        return xla::C64;
+      case 128:
+        return xla::C128;
+      }
+    }
+    if (element == "pred") {
+      return xla::PRED;
+    }
 
-// Template struct for resources. The struct lets us use templates
-// to store and retrieve open resources later on. This implementation
-// is the same as the approach taken in the goertzenator/nifpp
-// C++11 wrapper around the Erlang NIF API.
-template <typename T>
-struct resource_object {
-  static ErlNifResourceType *type;
+    return DecodeError("decode failed, unexpected type", term);
+  }
 };
-template<typename T> ErlNifResourceType* resource_object<T>::type = 0;
 
-// Default destructor passed when opening a resource. The default
-// behavior is to invoke the underlying objects destructor and
-// set the resource pointer to NULL.
-template <typename T>
-void default_dtor(ErlNifEnv* env, void * obj) {
-  T* resource = reinterpret_cast<T*>(obj);
-  resource->~T();
-  resource = nullptr;
-}
+// Define encoding for mlir::Type into %EXLA.Typespec{} term
+template <> struct Encoder<mlir::Type> {
+  static ERL_NIF_TERM encode(ErlNifEnv *env, const mlir::Type &type) {
+    ERL_NIF_TERM keys[] = {
+        fine::encode(env, exla::atoms::__struct__),
+        fine::encode(env, exla::atoms::type),
+        fine::encode(env, exla::atoms::shape),
+    };
 
-// Opens a resource for the given template type T. If no
-// destructor is given, uses the default destructor defined
-// above.
-template <typename T>
-int open_resource(ErlNifEnv* env,
-                  const char* mod,
-                  const char* name,
-                  ErlNifResourceDtor* dtor = nullptr) {
-  if (dtor == nullptr) {
-    dtor = &default_dtor<T>;
+    ERL_NIF_TERM values[] = {
+        fine::encode(env, exla::atoms::ElixirEXLATypespec),
+        encode_type(env, type),
+        encode_shape(env, type),
+    };
+
+    ERL_NIF_TERM map;
+    if (!enif_make_map_from_arrays(env, keys, values, 3, &map)) {
+      throw std::runtime_error("encode: failed to make a map");
+    }
+
+    return map;
   }
-  ErlNifResourceType *type;
-  ErlNifResourceFlags flags = ErlNifResourceFlags(ERL_NIF_RT_CREATE|ERL_NIF_RT_TAKEOVER);
-  type = enif_open_resource_type(env, mod, name, dtor, flags, NULL);
-  if (type == NULL) {
-    resource_object<T>::type = 0;
-    return -1;
-  } else {
-    resource_object<T>::type = type;
+
+private:
+  static ERL_NIF_TERM encode_type(ErlNifEnv *env, const mlir::Type &type) {
+    if (mlir::isa<mlir::stablehlo::TokenType>(type)) {
+      return fine::encode(env, exla::atoms::token);
+    }
+
+    std::optional<fine::Atom> type_name;
+    std::optional<uint64_t> type_size;
+
+    if (mlir::isa<mlir::RankedTensorType>(type)) {
+      auto tensor_type = mlir::cast<mlir::RankedTensorType>(type);
+      auto element_type = tensor_type.getElementType();
+
+      if (element_type.isSignlessInteger(1)) {
+        type_name = exla::atoms::pred;
+        type_size = 8;
+      } else if (auto integer_type =
+                     mlir::dyn_cast<mlir::IntegerType>(element_type)) {
+        if (integer_type.isUnsigned()) {
+          type_name = exla::atoms::u;
+        } else {
+          type_name = exla::atoms::s;
+        }
+
+        type_size = integer_type.getWidth();
+      } else if (element_type.isBF16()) {
+        type_name = exla::atoms::bf;
+        type_size = 16;
+      // Float8E4M3FNType doesn't have a convenience method like isBF16() on the
+      // base mlir::Type class, so we use mlir::isa<> for type checking instead.
+      } else if (mlir::isa<mlir::Float8E4M3FNType>(element_type)) {
+        type_name = exla::atoms::f8_e4m3fn;
+        type_size = 8;
+      } else if (auto float_type =
+                     mlir::dyn_cast<mlir::FloatType>(element_type)) {
+        type_name = exla::atoms::f;
+        type_size = float_type.getWidth();
+      } else if (auto complex_type =
+                     mlir::dyn_cast<mlir::ComplexType>(element_type)) {
+        auto element_type = complex_type.getElementType();
+        type_name = exla::atoms::c;
+        type_size = mlir::cast<mlir::FloatType>(element_type).getWidth() * 2;
+      }
+    }
+
+    if (type_name) {
+      return fine::encode(
+          env, std::make_tuple(type_name.value(), type_size.value()));
+    } else {
+      throw std::invalid_argument("encode failed, unexpected mlir type");
+    }
   }
-  return 1;
-}
 
-// Returns a resource of the given template type T.
-template <typename T>
-ERL_NIF_TERM get(ErlNifEnv* env, ERL_NIF_TERM term, T* &var) {
-  return enif_get_resource(env, term,
-                           resource_object<T>::type,
-                           reinterpret_cast<void**>(&var));
-}
+  static ERL_NIF_TERM encode_shape(ErlNifEnv *env, const mlir::Type &type) {
+    if (mlir::isa<mlir::stablehlo::TokenType>(type)) {
+      return enif_make_tuple(env, 0);
+    }
 
-// Creates a reference to the given resource of type T. We
-// use the move constructor by default because some XLA
-// objects delete the copy-constructor. The move is intended
-// to represent a transfer of ownership of the object to
-// the VM.
-template <typename T>
-ERL_NIF_TERM make(ErlNifEnv* env, T &var) {
-  void* ptr = enif_alloc_resource(resource_object<T>::type, sizeof(T));
-  new(ptr) T(std::move(var));
-  ERL_NIF_TERM ret = enif_make_resource(env, ptr);
-  enif_release_resource(ptr);
-  return ret;
-}
+    if (mlir::isa<mlir::RankedTensorType>(type)) {
+      auto tensor_type = mlir::cast<mlir::RankedTensorType>(type);
+      auto dims_array = tensor_type.getShape();
 
-// Containers
-//
-// Both tuples and lists are treated as vectors, but extracting
-// terms from both is slightly different, so we have to be
-// explicit in the naming convention in order to differentiate.
-//
-// We also support reading resources into vectors from both tuples
-// and lists. Once again, implementation is slightly different
-// for resources, so we need to be explicit.
-//
-// Similar to standard types, we only define implementations for
-// types used.
+      auto dims = std::vector<ERL_NIF_TERM>{};
+      dims.reserve(dims_array.size());
 
-int get_tuple(ErlNifEnv* env,
-              ERL_NIF_TERM tuple,
-              std::vector<int64> &var);
+      for (auto dim : dims_array) {
+        dims.push_back(fine::encode<int64_t>(env, dim));
+      }
 
-template <typename T>
-int get_tuple(ErlNifEnv* env, ERL_NIF_TERM tuple, std::vector<T> &var) {
-  const ERL_NIF_TERM* terms;
-  int length;
-  if (!enif_get_tuple(env, tuple, &length, &terms)) return 0;
-  var.reserve(length);
+      return enif_make_tuple_from_array(env, dims.data(), dims.size());
+    }
 
-  for (int i=0; i < length; i++) {
-    T* elem;
-    if (!get<T>(env, terms[i], elem)) return 0;
-    var.push_back(*elem);
+    throw std::invalid_argument("encode failed, unexpected mlir type");
   }
-  return 1;
-}
+};
 
-int get_list(ErlNifEnv* env,
-             ERL_NIF_TERM list,
-             std::vector<int64> &var);
-int get_list(ErlNifEnv* env,
-             ERL_NIF_TERM list,
-             std::vector<ErlNifBinary> &var);
+// Define encoding for xla::Shape into %EXLA.Typespec{} term
+template <> struct Encoder<xla::Shape> {
+  static ERL_NIF_TERM encode(ErlNifEnv *env, const xla::Shape &shape) {
+    ERL_NIF_TERM keys[] = {
+        fine::encode(env, exla::atoms::__struct__),
+        fine::encode(env, exla::atoms::type),
+        fine::encode(env, exla::atoms::shape),
+    };
 
-template <typename T>
-int get_list(ErlNifEnv* env, ERL_NIF_TERM list, std::vector<T*> &var) {
-  unsigned int length;
-  if (!enif_get_list_length(env, list, &length)) return 0;
-  var.reserve(length);
-  ERL_NIF_TERM head, tail;
+    ERL_NIF_TERM values[] = {
+        fine::encode(env, exla::atoms::ElixirEXLATypespec),
+        encode_type(env, shape),
+        encode_shape(env, shape),
+    };
 
-  while (enif_get_list_cell(env, list, &head, &tail)) {
-    T* elem;
-    if (!get<T>(env, head, elem)) return 0;
-    var.push_back(elem);
-    list = tail;
+    ERL_NIF_TERM map;
+    if (!enif_make_map_from_arrays(env, keys, values, 3, &map)) {
+      throw std::runtime_error("encode: failed to make a map");
+    }
+
+    return map;
   }
-  return 1;
-}
 
-template <typename T>
-int get_list(ErlNifEnv* env, ERL_NIF_TERM list, std::vector<T> &var) {
-  unsigned int length;
-  if (!enif_get_list_length(env, list, &length)) return 0;
-  var.reserve(length);
-  ERL_NIF_TERM head, tail;
+private:
+  static ERL_NIF_TERM encode_type(ErlNifEnv *env, const xla::Shape &shape) {
+    auto ptype = shape.element_type();
 
-  while (enif_get_list_cell(env, list, &head, &tail)) {
-    T* elem;
-    if (!get<T>(env, head, elem)) return 0;
-    var.push_back(*elem);
-    list = tail;
+    // Tokens are encoded as the atom :token
+    if (ptype == xla::TOKEN) {
+      return fine::encode(env, exla::atoms::token);
+    }
+
+    std::optional<fine::Atom> type_name;
+    std::optional<uint64_t> type_size;
+
+    switch (ptype) {
+    case xla::PRED:
+      type_name = exla::atoms::pred;
+      type_size = 8;
+      break;
+
+    case xla::U8:
+      type_name = exla::atoms::u;
+      type_size = 8;
+      break;
+    case xla::U16:
+      type_name = exla::atoms::u;
+      type_size = 16;
+      break;
+    case xla::U32:
+      type_name = exla::atoms::u;
+      type_size = 32;
+      break;
+    case xla::U64:
+      type_name = exla::atoms::u;
+      type_size = 64;
+      break;
+
+    case xla::S8:
+      type_name = exla::atoms::s;
+      type_size = 8;
+      break;
+    case xla::S16:
+      type_name = exla::atoms::s;
+      type_size = 16;
+      break;
+    case xla::S32:
+      type_name = exla::atoms::s;
+      type_size = 32;
+      break;
+    case xla::S64:
+      type_name = exla::atoms::s;
+      type_size = 64;
+      break;
+
+    case xla::F8E5M2:
+      type_name = exla::atoms::f;
+      type_size = 8;
+      break;
+    case xla::F8E4M3FN:
+      type_name = exla::atoms::f8_e4m3fn;
+      type_size = 8;
+      break;
+
+    case xla::F16:
+      type_name = exla::atoms::f;
+      type_size = 16;
+      break;
+    case xla::F32:
+      type_name = exla::atoms::f;
+      type_size = 32;
+      break;
+    case xla::F64:
+      type_name = exla::atoms::f;
+      type_size = 64;
+      break;
+
+    case xla::BF16:
+      type_name = exla::atoms::bf;
+      type_size = 16;
+      break;
+
+    case xla::C64:
+      type_name = exla::atoms::c;
+      type_size = 64;
+      break;
+    case xla::C128:
+      type_name = exla::atoms::c;
+      type_size = 128;
+      break;
+
+    default:
+      break;
+    }
+
+    if (type_name && type_size) {
+      return fine::encode(
+          env, std::make_tuple(type_name.value(), type_size.value()));
+    }
+
+    throw std::invalid_argument("encode failed, unexpected xla::PrimitiveType");
   }
-  return 1;
-}
 
-int get_binary(ErlNifEnv* env, ERL_NIF_TERM term, ErlNifBinary* var);
+  static ERL_NIF_TERM encode_shape(ErlNifEnv *env, const xla::Shape &shape) {
+    auto dims = shape.dimensions();
+    std::vector<ERL_NIF_TERM> dim_terms;
+    dim_terms.reserve(dims.size());
 
-ERL_NIF_TERM make_map(ErlNifEnv* env, std::map<std::string, int>& map);
+    for (int64_t dim : dims) {
+      dim_terms.push_back(fine::encode(env, dim));
+    }
 
-// XLA Protobuf Types
-//
-// See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/compiler/xla/xla_data.proto
-// for more details on each type and additional types not listed here.
-
-// Gets a padding configuration from `list`. A padding configuration
-// is a list of 3-tuples representing edge high, edge low, and interior
-// padding.
-int get_padding_config(ErlNifEnv* env,
-                       ERL_NIF_TERM list,
-                       xla::PaddingConfig* padding_config);
-
-// Gets dimension numbers for usage in the XLA DotGeneral operation.
-// Dot dimension numbers are a 2-tuple of lists. The first list
-// represents the lhs contraction dimensions. The second list
-// represents the rhs contraction dimensions. We do not match
-// on the batch dimensions for now.
-int get_dot_dimension_numbers(ErlNifEnv* env,
-                              ERL_NIF_TERM tuple,
-                              xla::DotDimensionNumbers* dims);
-
-// Gets a precision configuration from the configuration term.
-// The term should be an integer `0`, `1`, or `2` corresponding
-// to default, high, or highest precision respectively. Precision
-// configuration is set for each term in an operation.
-int get_precision_config(ErlNifEnv* env,
-                         ERL_NIF_TERM config_term,
-                         int num_operands,
-                         xla::PrecisionConfig* precision_config);
-
-// Gets the convolution dimension numbers. Convolutions are determined
-// based on input, kernel, and output batch and feature dimensions.
-// We receive the dimension numbers as a 3-tuple of tuples. Each tuple
-// corresponds to input batch/feature dimensions, kernel input/output
-// feature dimensions, and output batch/feature dimensions respectively.
-int get_conv_dimension_numbers(ErlNifEnv* env,
-                               ERL_NIF_TERM tuple,
-                               xla::ConvolutionDimensionNumbers* dimension_numbers);
-
-// Gets a general padding configuration. This is slightly different from
-// get_padding_config for usage in a convolution. The convolution only
-// supports passing padding as a vector of pairs of edge high, edge low padding
-// values. We receive the padding configuration as a list of 2-tuples.
-int get_general_padding(ErlNifEnv* env,
-                        ERL_NIF_TERM padding_term,
-                        std::vector<std::pair<int64, int64>>& padding);
-
-// Gets the primitive type from the given term. The term is a string
-// encoding one of the XLA primitive types.
-int get_primitive_type(ErlNifEnv* env, ERL_NIF_TERM term, xla::PrimitiveType* type);
-
-// Template for retrieving a value from a scalar. This is
-// necessary to avoid having to use templates in the NIF.
-template <
-  xla::PrimitiveType type,
-  typename T = typename xla::primitive_util::PrimitiveTypeToNative<type>::type>
-T get_value(ErlNifEnv* env, ERL_NIF_TERM term) {
-  T value;
-  get(env, term, &value);
-  return value;
-}
-
-// Extracts information from `GetShape` into a useable term.
-ERL_NIF_TERM make_shape_info(ErlNifEnv* env, xla::Shape shape);
-
-}  // namespace nif
-}  // namespace exla
+    return enif_make_tuple_from_array(env, dim_terms.data(), dim_terms.size());
+  }
+};
+} // namespace fine
 
 // Helper Macros
 //
-// See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/stream_executor/lib/statusor.h
+// See:
+// https://github.com/tensorflow/tensorflow/blob/master/tensorflow/stream_executor/lib/statusor.h
 
-#define EXLA_STATUS_MACROS_CONCAT_NAME(x, y)                                 \
+#define EXLA_STATUS_MACROS_CONCAT_NAME(x, y)                                   \
   EXLA_STATUS_MACROS_CONCAT_NAME_IMPL(x, y)
 
 #define EXLA_STATUS_MACROS_CONCAT_NAME_IMPL(x, y) x##y
 
-// Macro to be used to consume StatusOr from within a NIF. Will
-// bind lhs to value if the status is OK, otherwise will return
-// `{:error, msg}`.
-#define EXLA_ASSIGN_OR_RETURN_NIF(lhs, rexpr, env)                           \
-  EXLA_ASSIGN_OR_RETURN_NIF_IMPL(                                            \
-    EXLA_STATUS_MACROS_CONCAT_NAME(_status_or_value, __COUNTER__),           \
-                                    lhs, rexpr, env)
-
-#define EXLA_ASSIGN_OR_RETURN_NIF_IMPL(statusor, lhs, rexpr, env)            \
-  auto statusor = (rexpr);                                                   \
-  if (!statusor.ok()) {                                                      \
-    return exla::nif::error(env, statusor.status().error_message().c_str()); \
-  }                                                                          \
-  lhs = std::move(statusor.ValueOrDie());
-
 // Macro to be used to consume StatusOr. Will bind lhs
 // to value if the status is OK, otherwise will return
 // the status.
-#define EXLA_ASSIGN_OR_RETURN(lhs, rexpr)                                    \
-  EXLA_ASSIGN_OR_RETURN_IMPL(                                                \
-    EXLA_STATUS_MACROS_CONCAT_NAME(                                          \
-      _status_or_value, __COUNTER__),                                        \
-  lhs, rexpr)
+#define EXLA_ASSIGN_OR_RETURN(lhs, rexpr)                                      \
+  EXLA_ASSIGN_OR_RETURN_IMPL(                                                  \
+      EXLA_STATUS_MACROS_CONCAT_NAME(_status_or_value, __COUNTER__), lhs,      \
+      rexpr)
 
-#define EXLA_ASSIGN_OR_RETURN_IMPL(statusor, lhs, rexpr)                     \
-  auto statusor = (rexpr);                                                   \
-  if (!statusor.ok()) {                                                      \
-    return statusor.status();                                                \
-  }                                                                          \
-  lhs = std::move(statusor.ValueOrDie());
+#define EXLA_ASSIGN_OR_RETURN_IMPL(statusor, lhs, rexpr)                       \
+  auto statusor = (rexpr);                                                     \
+  if (!statusor.ok()) {                                                        \
+    return statusor.status();                                                  \
+  }                                                                            \
+  lhs = std::move(statusor.value());
 
 #endif

@@ -11,11 +11,17 @@ defmodule Nx.TemplateBackend do
   defstruct []
 
   @impl true
-  def inspect(%Nx.Tensor{}, _opts) do
-    "Nx.TemplateBackend"
+  def inspect(%Nx.Tensor{}, opts) do
+    if opts.custom_options[:skip_template_backend_header] do
+      Inspect.Algebra.empty()
+    else
+      "Nx.TemplateBackend"
+    end
   end
 
-  funs = Nx.Backend.behaviour_info(:callbacks) -- Module.definitions_in(__MODULE__, :def)
+  funs =
+    Nx.Backend.behaviour_info(:callbacks) --
+      (Nx.Backend.behaviour_info(:optional_callbacks) ++ Module.definitions_in(__MODULE__, :def))
 
   for {fun, arity} <- funs do
     args = Macro.generate_arguments(arity, __MODULE__)

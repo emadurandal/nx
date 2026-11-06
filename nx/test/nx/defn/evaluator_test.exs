@@ -4,25 +4,6 @@ defmodule Nx.Defn.EvaluatorTest do
   alias Nx.Tensor, as: T
   import Nx.Defn
 
-  @defn_compiler Nx.Defn.Evaluator
-  defn add(a, b), do: {a + b, a - b}
-
-  # Check the attribute has been reset
-  nil = Module.get_attribute(__MODULE__, :defn_compiler)
-
-  test "can be set explicitly set" do
-    assert add(1, 2) == {Nx.tensor(3), Nx.tensor(-1)}
-  end
-
-  test "is the default compiler" do
-    defmodule DefaultCompiler do
-      import Nx.Defn
-      defn add(a, b), do: a + b
-    end
-
-    assert DefaultCompiler.add(1, 2) == Nx.tensor(3)
-  end
-
   defn add_two_int(t), do: Nx.add(t, 2)
   defn add_two_float(t), do: Nx.add(t, 2)
 
@@ -35,7 +16,7 @@ defmodule Nx.Defn.EvaluatorTest do
   defn iota(), do: Nx.iota({2, 2})
 
   test "iota" do
-    assert %T{shape: {2, 2}, type: {:s, 64}} = iota()
+    assert %T{shape: {2, 2}, type: {:s, 32}} = iota()
   end
 
   defn concatenate(a, b), do: Nx.concatenate([a, b])
@@ -43,12 +24,35 @@ defmodule Nx.Defn.EvaluatorTest do
   test "concatenate" do
     assert concatenate(Nx.tensor([1, 2, 3]), Nx.tensor([4, 5, 6])) ==
              Nx.tensor([1, 2, 3, 4, 5, 6])
+
+    assert_raise RuntimeError, "cannot perform operations on a Nx.TemplateBackend tensor", fn ->
+      # Check we will pick Nx.Template from list
+      concatenate(Nx.template({3}, {:f, 32}), Nx.template({3}, {:f, 32}))
+    end
+  end
+
+  defn slice(a, b), do: Nx.slice(a, [b], [1])
+
+  test "slice" do
+    assert slice(Nx.tensor([1, 2, 3]), Nx.tensor(0)) == Nx.tensor([1])
+
+    assert_raise RuntimeError, "cannot perform operations on a Nx.TemplateBackend tensor", fn ->
+      # Check we will pick Nx.Template from the slice
+      slice(Nx.tensor([1, 2, 3]), Nx.template({}, {:s, 32}))
+    end
   end
 
   defn reshape(t), do: Nx.reshape(t, {3, 2})
 
   test "reshape" do
-    assert %T{shape: {3, 2}, type: {:s, 64}} = reshape(Nx.iota({2, 3}))
+    assert %T{shape: {3, 2}, type: {:s, 32}} = reshape(Nx.iota({2, 3}))
+  end
+
+  defn reduce_window(t1, acc),
+    do: Nx.window_reduce(t1, acc, {2}, [padding: :valid], fn x, acc -> x + acc end)
+
+  test "window reduce" do
+    assert reduce_window(Nx.tensor([1, 2, 3]), 0) == Nx.tensor([3, 5])
   end
 
   describe "decompositions" do
@@ -65,17 +69,34 @@ defmodule Nx.Defn.EvaluatorTest do
 
     test "qr" do
       assert {q, r} = qr(Nx.iota({3, 2}))
-      assert q == Nx.tensor([[0.0, 1.0], [1.0, 0.0], [0.0, 0.0]])
-      assert r == Nx.tensor([[2.0, 3.0], [0.0, 1.0]])
+
+      Nx.Testing.assert_all_close(
+        q,
+        Nx.tensor([
+          [0.0, 0.9128709435462952],
+          [0.4472135901451111, 0.3651483356952667],
+          [0.8944271802902222, -0.1825741082429886]
+        ]),
+        atol: 1.0e-6
+      )
+
+      Nx.Testing.assert_all_close(
+        r,
+        Nx.tensor([
+          [4.4721360206604, 5.81377649307251],
+          [2.433349663988338e-7, 1.0954453945159912]
+        ]),
+        atol: 1.0e-6
+      )
     end
 
     defn svd(t), do: Nx.LinAlg.svd(t)
 
     test "svd" do
       assert {u, s, vt} = svd(Nx.tensor([[1, 0, 0], [0, 1, 0], [0, 0, -1]]))
-      assert u == Nx.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+      assert u == Nx.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]])
       assert s == Nx.tensor([1.0, 1.0, 1.0])
-      assert vt == Nx.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]])
+      assert vt == Nx.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
     end
   end
 
@@ -254,16 +275,6 @@ defmodule Nx.Defn.EvaluatorTest do
     test "calls external anonymous function via reduce" do
       assert calls_reduce_fun(&Nx.add/2, Nx.tensor([1, 2, 3])) == Nx.tensor(6)
     end
-
-    defn calls_map_fun(t) do
-      Nx.map(t, fn x ->
-        if Nx.equal(x, 0), do: 1, else: -x
-      end)
-    end
-
-    test "calls internal anonymous function via map" do
-      assert calls_map_fun(Nx.tensor([0, 1, 2])) == Nx.tensor([1, -1, -2])
-    end
   end
 
   describe "access" do
@@ -271,6 +282,672 @@ defmodule Nx.Defn.EvaluatorTest do
 
     test "supports correct access" do
       assert slice1(Nx.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])) == Nx.tensor(4)
+    end
+  end
+
+  defn container_cond(var, cond) do
+    if cond do
+      %{var | a: var.a + 1}
+    else
+      %{var | b: var.b - 1}
+    end
+  end
+
+  describe "containers" do
+    test "input, output, and cond" do
+      container = %Container{a: 1, b: -1, c: :reset, d: :kept}
+
+      assert container_cond(container, 1) ==
+               %Container{a: Nx.tensor(2), b: Nx.tensor(-1), c: %{}, d: :kept}
+
+      assert container_cond(container, 0) ==
+               %Container{a: Nx.tensor(1), b: Nx.tensor(-2), c: %{}, d: :kept}
+    end
+  end
+
+  defn labelled_inspect(a, b), do: print_value(a + b, label: "add")
+
+  test "print_value/2 with options" do
+    assert ExUnit.CaptureIO.capture_io(fn -> labelled_inspect(1, 2) end) ==
+             """
+             add: #Nx.Tensor<
+               s32
+               3
+             >
+             """
+  end
+
+  defn mapped_inspect(a, b), do: print_value(a + b, fn x -> x * 2 end)
+
+  test "print_value/2 with mapping function" do
+    assert ExUnit.CaptureIO.capture_io(fn ->
+             assert mapped_inspect(1, 2) == Nx.tensor(3)
+           end) ==
+             """
+             #Nx.Tensor<
+               s32
+               6
+             >
+             """
+  end
+
+  describe "io_calls" do
+    defp send_to_self(value), do: send(self(), value)
+
+    defp drain_mailbox do
+      receive do
+        _ -> drain_mailbox()
+      after
+        0 -> :ok
+      end
+    end
+
+    defn basic_hook(a, b), do: io_call(a + b, :example, &send_to_self({:default, &1}))
+
+    test "basic io_call with overriddes" do
+      assert basic_hook(1, 2) == Nx.tensor(3)
+      assert_received {:default, tensor}
+      assert tensor == Nx.tensor(3)
+
+      assert Nx.Defn.jit(&basic_hook/2).(1, 2) == Nx.tensor(3)
+      assert_received {:default, tensor}
+      assert tensor == Nx.tensor(3)
+
+      fun = Nx.Defn.jit(&basic_hook/2, hooks: %{example: &send_to_self({:custom, &1})})
+      assert fun.(1, 2) == Nx.tensor(3)
+
+      assert_received {:custom, tensor}
+      assert tensor == Nx.tensor(3)
+    end
+
+    defn metadata_hook(a) do
+      a
+      |> Nx.add(1)
+      |> stop_grad()
+      |> io_call(:example, &send_to_self({:default, &1}))
+    end
+
+    test "hook on metadata-wrapped expression" do
+      assert metadata_hook(1) == Nx.tensor(2)
+      assert_received {:default, tensor}
+      assert tensor == Nx.tensor(2)
+
+      assert Nx.Defn.jit(&metadata_hook/1).(1) == Nx.tensor(2)
+      assert_received {:default, tensor}
+      assert tensor == Nx.tensor(2)
+    end
+
+    defn container_hook(a, b), do: io_call({a, b}, :example, &send_to_self({:default, &1}))
+
+    test "container io_call with overriddes" do
+      assert container_hook(1, 2) == {Nx.tensor(1), Nx.tensor(2)}
+      assert_received {:default, tuple}
+      assert tuple == {Nx.tensor(1), Nx.tensor(2)}
+
+      assert Nx.Defn.jit(&container_hook/2).(1, 2) == {Nx.tensor(1), Nx.tensor(2)}
+      assert_received {:default, tuple}
+      assert tuple == {Nx.tensor(1), Nx.tensor(2)}
+
+      fun = Nx.Defn.jit(&container_hook/2, hooks: %{example: &send_to_self({:custom, &1})})
+      assert fun.(1, 2) == {Nx.tensor(1), Nx.tensor(2)}
+
+      assert_received {:custom, tuple}
+      assert tuple == {Nx.tensor(1), Nx.tensor(2)}
+    end
+
+    defn side_effect_io_calls(a, b) do
+      b = io_call(b, :b)
+      a = io_call(a, :a)
+      {b, a}
+    end
+
+    test "side effect io_calls" do
+      drain_mailbox()
+
+      assert side_effect_io_calls(1, 2) == {Nx.tensor(2), Nx.tensor(1)}
+      refute_received _
+
+      io_calls = %{a: &send_to_self({:a, &1})}
+
+      Nx.Defn.jit(&side_effect_io_calls/2, hooks: io_calls).(1, 2)
+
+      assert_received {:a, tensor}
+      assert tensor == Nx.tensor(1)
+      refute_received _
+
+      io_calls = %{b: &send_to_self({:b, &1})}
+
+      Nx.Defn.jit(&side_effect_io_calls/2, hooks: io_calls).(1, 2)
+
+      assert_received {:b, tensor}
+      assert tensor == Nx.tensor(2)
+      refute_received _
+
+      drain_mailbox()
+      io_calls = %{a: &send_to_self({:a, &1}), b: &send_to_self({:b, &1})}
+      Nx.Defn.jit(&side_effect_io_calls/2, hooks: io_calls).(1, 2)
+      assert_received {:b, tensor}
+      assert tensor == Nx.tensor(2)
+      assert_received {:a, tensor}
+      assert tensor == Nx.tensor(1)
+      refute_received _
+    end
+
+    defn side_effect_nested_io_calls(a, b) do
+      b = io_call(b, :b)
+      a = io_call(a, :a)
+      {b, a}
+    end
+
+    test "side effect nested io_calls" do
+      drain_mailbox()
+
+      assert side_effect_nested_io_calls(1, 2) == {Nx.tensor(2), Nx.tensor(1)}
+
+      io_calls = %{a: &send_to_self({:a, &1})}
+
+      Nx.Defn.jit(&side_effect_nested_io_calls/2, hooks: io_calls).(1, 2)
+
+      assert_received {:a, tensor}
+      assert tensor == Nx.tensor(1)
+      refute_received _
+
+      io_calls = %{b: &send_to_self({:b, &1})}
+
+      Nx.Defn.jit(&side_effect_nested_io_calls/2, hooks: io_calls).(1, 2)
+
+      assert_received {:b, tensor}
+      assert tensor == Nx.tensor(2)
+      refute_received _
+
+      drain_mailbox()
+      io_calls = %{a: &send_to_self({:a, &1}), b: &send_to_self({:b, &1})}
+      Nx.Defn.jit(&side_effect_nested_io_calls/2, hooks: io_calls).(1, 2)
+      assert_received {:b, tensor}
+      assert tensor == Nx.tensor(2)
+      assert_received {:a, tensor}
+      assert tensor == Nx.tensor(1)
+      refute_received _
+    end
+
+    defn side_effect_nested_hook_with_default(a, b) do
+      b = io_call(b, :b, &send_to_self({:b, &1}))
+      a = io_call(a, :a)
+      {a, b}
+    end
+
+    test "side effect nested io_calls with default" do
+      drain_mailbox()
+
+      assert side_effect_nested_hook_with_default(1, 2) == {Nx.tensor(1), Nx.tensor(2)}
+
+      assert_received {:b, tensor}
+      assert tensor == Nx.tensor(2)
+      refute_received _
+
+      drain_mailbox()
+      io_calls = %{a: &send_to_self({:a, &1})}
+      Nx.Defn.jit(&side_effect_nested_hook_with_default/2, hooks: io_calls).(1, 2)
+      assert_received {:b, tensor}
+      assert tensor == Nx.tensor(2)
+      assert_received {:a, tensor}
+      assert tensor == Nx.tensor(1)
+      refute_received _
+
+      drain_mailbox()
+      io_calls = %{b: &send_to_self({:custom, &1})}
+
+      Nx.Defn.jit(&side_effect_nested_hook_with_default/2, hooks: io_calls).(1, 2)
+
+      assert_received {:custom, tensor}
+      assert tensor == Nx.tensor(2)
+
+      refute_received _
+    end
+
+    defn hook_upto10(x) do
+      while x, Nx.less(x, 10) do
+        io_call(x + 1, :while)
+      end
+    end
+
+    test "inside loops" do
+      assert hook_upto10(5) == Nx.tensor(10)
+      refute_received _
+
+      assert Nx.Defn.jit(&hook_upto10/1, hooks: %{while: &send_to_self({:while, &1})}).(5) ==
+               Nx.tensor(10)
+
+      assert_received {:while, tensor}
+      assert tensor == Nx.tensor(6)
+      assert_received {:while, tensor}
+      assert tensor == Nx.tensor(7)
+      assert_received {:while, tensor}
+      assert tensor == Nx.tensor(8)
+      assert_received {:while, tensor}
+      assert tensor == Nx.tensor(9)
+      assert_received {:while, tensor}
+      assert tensor == Nx.tensor(10)
+      refute_received _
+
+      assert Nx.Defn.jit(&hook_upto10/1).(5) == Nx.tensor(10)
+      refute_received _
+    end
+  end
+
+  describe "cond cache" do
+    # The goal of those tests is to show that expressions inside cond are cached,
+    # regardless of evaluation order.
+    defn cond_cache_predicate(threshold, a, b) do
+      res = io_call(a + b, :example, &send_to_self({:io_call, &1}))
+
+      if res > threshold do
+        res
+      else
+        res + 1
+      end
+    end
+
+    test "an expression used by the predicate and by a branch is evaluated once" do
+      assert cond_cache_predicate(0, 1, 2) == Nx.tensor(3)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+
+      assert cond_cache_predicate(10, 1, 2) == Nx.tensor(4)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+    end
+
+    defn cond_cache_left(bool, a, b) do
+      res = io_call(a + b, :example, &send_to_self({:io_call, &1}))
+
+      cond =
+        if bool do
+          res
+        else
+          0
+        end
+
+      cond * res
+    end
+
+    test "on lhs" do
+      assert cond_cache_left(0, 1, 2) == Nx.tensor(0)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+
+      assert cond_cache_left(1, 1, 2) == Nx.tensor(9)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+    end
+
+    defn cond_cache_right(bool, a, b) do
+      res = io_call(a + b, :example, &send_to_self({:io_call, &1}))
+
+      cond =
+        if bool do
+          res
+        else
+          0
+        end
+
+      res * cond
+    end
+
+    test "on rhs" do
+      assert cond_cache_right(0, 1, 2) == Nx.tensor(0)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+
+      assert cond_cache_right(1, 1, 2) == Nx.tensor(9)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+    end
+
+    defn cond_cache_both(bool, a, b) do
+      res = io_call(a + b, :example, &send_to_self({:io_call, &1}))
+
+      left =
+        if bool do
+          res
+        else
+          -res
+        end
+
+      right =
+        if bool do
+          res * 2
+        else
+          res
+        end
+
+      left * right
+    end
+
+    test "on both" do
+      assert cond_cache_both(0, 4, 5) == Nx.tensor(-81)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+
+      assert cond_cache_both(1, 4, 5) == Nx.tensor(162)
+      assert_received {:io_call, _}
+      refute_received {:io_call, _}
+    end
+
+    defn cond_cache_map(state) do
+      state =
+        if state.iteration < 4 do
+          if state.iteration != 1 do
+            state
+          else
+            state
+          end
+        else
+          state
+        end
+
+      %{state | iteration: state.iteration + 1}
+    end
+
+    test "with nested map" do
+      assert cond_cache_map(%{iteration: 0}) ==
+               %{iteration: Nx.tensor(1)}
+
+      # Use :abc/:xyz so we try different key orderings.
+      assert cond_cache_map(%{iteration: 0, abc: 1}) ==
+               %{iteration: Nx.tensor(1), abc: Nx.tensor(1)}
+
+      assert cond_cache_map(%{iteration: 0, xyz: 1}) ==
+               %{iteration: Nx.tensor(1), xyz: Nx.tensor(1)}
+
+      assert cond_cache_map(%{iteration: 4}) ==
+               %{iteration: Nx.tensor(5)}
+
+      # Use :abc/:xyz so we try different key orderings.
+      assert cond_cache_map(%{iteration: 4, abc: 1}) ==
+               %{iteration: Nx.tensor(5), abc: Nx.tensor(1)}
+
+      assert cond_cache_map(%{iteration: 4, xyz: 1}) ==
+               %{iteration: Nx.tensor(5), xyz: Nx.tensor(1)}
+    end
+
+    defn cond_nested_condition_cache(state) do
+      {state, prev} =
+        if state.iteration < 12 do
+          sign = if(state.iteration < 2, do: 1, else: -1)
+
+          factor =
+            if sign >= 0 do
+              2
+            else
+              1
+            end
+
+          {state, factor}
+        else
+          {state, 1}
+        end
+
+      %{state | iteration: state.iteration + prev}
+    end
+
+    test "with nested condition" do
+      assert cond_nested_condition_cache(%{iteration: 0}) == %{iteration: Nx.tensor(2)}
+      assert cond_nested_condition_cache(%{iteration: 12}) == %{iteration: Nx.tensor(13)}
+    end
+  end
+
+  describe "vectorization" do
+    defn vectorize_within_defn(t, a) do
+      t =
+        t
+        |> Nx.vectorize(a: 1, b: 2)
+        |> Nx.add(1)
+
+      a = Nx.vectorize(a, a: 1)
+
+      Nx.select(a, t, a)
+    end
+
+    test "vectorize works inside defn" do
+      t = Nx.tensor([[1, 2]])
+
+      assert vectorize_within_defn(t, Nx.tensor([1])) == Nx.vectorize(Nx.add(t, 1), a: 1, b: 2)
+
+      assert vectorize_within_defn(t, Nx.tensor([0])) ==
+               Nx.vectorize(Nx.tensor([[0, 0]]), a: 1, b: 2)
+    end
+
+    defn vectorized_while(a, b, i \\ 0) do
+      while({a, b, i}, i < 2) do
+        {a + b, b, i + 1}
+      end
+    end
+
+    defn vectorized_cond(cond_1, on_1, cond_2, on_2, on_3) do
+      cond do
+        cond_1 -> on_1
+        cond_2 -> on_2
+        true -> on_3
+      end
+    end
+
+    defn vectorized_metadata(t) do
+      x = Nx.devectorize(t)
+      x = Nx.vectorize(x, t.vectorized_axes)
+
+      stop_grad(x)
+    end
+
+    test "while" do
+      t = Nx.iota({2, 3}, vectorized_axes: [a: 1])
+
+      assert {result, one, i} = vectorized_while(t, 1)
+
+      assert result == Nx.add(t, 2)
+      assert one == Nx.tensor(1)
+      assert i == Nx.tensor(2)
+    end
+
+    test "while raises on incompatible body/initial" do
+      t = Nx.iota({2, 3}, vectorized_axes: [a: 1], type: :s32)
+
+      message = """
+      test/nx/defn/evaluator_test.exs:722: the do-block in while must return tensors with the same shape, type, and names as the initial arguments.
+
+      {\e[32m
+       <<<<< Body (do-block) <<<<<
+       #Nx.Tensor<
+         vectorized[a: 2]
+         s32[2][3]
+       >
+       ==========
+       \e[31m#Nx.Tensor<
+         vectorized[a: 1]
+         s32[2][3]
+       >
+       >>>>>     Initial     >>>>>
+       \e[0m, #Nx.Tensor<
+         vectorized[a: 2]
+         s32[2][3]
+       >, #Nx.Tensor<
+         s32
+       >}
+      """
+
+      assert_raise CompileError, message, fn ->
+        vectorized_while(t, Nx.iota({2, 3}, vectorized_axes: [a: 2], type: :s32))
+      end
+    end
+
+    test "while raises on vectorized condition" do
+      t = Nx.iota({2, 3}, vectorized_axes: [a: 1])
+
+      error =
+        """
+        test/nx/defn/evaluator_test.exs:722: condition must be a scalar tensor, got: #Nx.Tensor<
+          vectorized[x: 1]
+          u8[1]
+        \s\s
+          Nx.Defn.Expr
+          parameter a:2   s32[1][1]
+          b = less a, 2   u8[1][1]
+        >, consider using Nx.all/1 or Nx.any/1 to obtain a scalar predicate from tensor
+        """
+        |> String.trim()
+
+      assert_raise CompileError, error, fn ->
+        vectorized_while(t, t, Nx.iota({1}, vectorized_axes: [x: 1]))
+      end
+    end
+
+    test "cond" do
+      a = Nx.tensor(3)
+      b = Nx.tensor(2)
+      c = Nx.vectorize(Nx.tensor([[1]]), x: 1, y: 1)
+      d = Nx.vectorize(Nx.tensor([[1, 2]]), x: 1, y: 2)
+
+      assert {c, c} == vectorized_cond(0, {c, c}, 0, {c, c}, {c, c})
+      assert Nx.add(c, 2) == vectorized_cond(1, a, 0, b, c)
+      assert Nx.add(c, 1) == vectorized_cond(0, a, 1, b, c)
+
+      # vectorization edge cases
+
+      [c_vec_d, _] = Nx.broadcast_vectors([c, d])
+
+      assert c_vec_d == vectorized_cond(0, a, 1, c, d)
+      assert d == vectorized_cond(0, a, 0, c, d)
+    end
+
+    test "metadata with expr" do
+      a = Nx.iota({1}, vectorized_axes: [x: 2])
+      assert a == vectorized_metadata(a)
+    end
+  end
+
+  describe "runtime raise" do
+    defn maybe_raise(value, predicate) do
+      if predicate do
+        runtime_raise("runtime check failed")
+      else
+        value
+      end
+    end
+
+    defn all_raise(predicate) do
+      if predicate do
+        runtime_raise("true branch")
+      else
+        runtime_raise("false branch")
+      end
+    end
+
+    defn halt_on_nth(x, n) do
+      {x, i, _n} =
+        while {x, i = 0, n}, i < 10 do
+          i =
+            if i == n do
+              runtime_raise("Halting on selected iteration")
+            else
+              i
+            end
+
+          {x + 1, i + 1, n}
+        end
+
+      {x, i}
+    end
+
+    defn top_level_raise(_value) do
+      raise "top-level"
+    end
+
+    defn raise_inside_if(value, predicate) do
+      if predicate do
+        raise "always raises while building"
+      else
+        value
+      end
+    end
+
+    defn container_runtime_raise(container, predicate) do
+      if predicate do
+        io_call(container, fn _ -> raise "container check failed" end)
+      else
+        container
+      end
+    end
+
+    defn static_false_runtime_raise(value) do
+      if false do
+        runtime_raise("unreachable")
+      else
+        value
+      end
+    end
+
+    defn static_true_runtime_raise(value) do
+      if true do
+        runtime_raise("static check failed")
+      else
+        value
+      end
+    end
+
+    test "passes values through when the predicate is false" do
+      assert maybe_raise(Nx.tensor([1, 2]), 0) == Nx.tensor([1, 2])
+    end
+
+    test "raises when the predicate is true" do
+      assert_raise RuntimeError, "runtime check failed", fn ->
+        maybe_raise(Nx.tensor(1), 1)
+      end
+    end
+
+    test "selects the raising branch when every branch raises" do
+      assert_raise RuntimeError, "true branch", fn -> all_raise(1) end
+      assert_raise RuntimeError, "false branch", fn -> all_raise(0) end
+    end
+
+    test "halts a while loop on the selected iteration" do
+      assert {x, i} = halt_on_nth(0, 11)
+      assert x == Nx.tensor(10)
+      assert i == Nx.tensor(10)
+
+      assert_raise RuntimeError, "Halting on selected iteration", fn ->
+        halt_on_nth(0, 5)
+      end
+    end
+
+    test "raises at trace time from the top level" do
+      assert_raise RuntimeError, "top-level", fn ->
+        top_level_raise(Nx.tensor(1))
+      end
+    end
+
+    test "raise inside if still raises while building" do
+      assert_raise RuntimeError, "always raises while building", fn ->
+        raise_inside_if(Nx.tensor(1), 0)
+      end
+    end
+
+    test "passes containers through and raises from the container branch" do
+      container = %Container{a: 1, b: 2, c: :reset, d: :kept}
+
+      assert container_runtime_raise(container, 0) ==
+               %Container{a: Nx.tensor(1), b: Nx.tensor(2), c: %{}, d: :kept}
+
+      assert_raise RuntimeError, "container check failed", fn ->
+        container_runtime_raise(container, 1)
+      end
+    end
+
+    test "known boolean predicates still raise at runtime" do
+      assert static_false_runtime_raise(Nx.tensor(3)) == Nx.tensor(3)
+
+      assert_raise RuntimeError, "static check failed", fn ->
+        static_true_runtime_raise(Nx.tensor(1))
+      end
     end
   end
 end

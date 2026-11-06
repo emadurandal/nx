@@ -1,60 +1,24 @@
 defmodule Nx.TensorTest do
   use ExUnit.Case, async: true
 
-  defmodule ProcessBackend do
-    @behaviour Nx.Backend
-    defstruct [:key]
-
-    funs = Nx.Backend.behaviour_info(:callbacks) -- [from_binary: 3, backend_deallocate: 1]
-
-    for {fun, arity} <- funs do
-      args = Macro.generate_arguments(arity, __MODULE__)
-
-      def unquote(fun)(unquote_splicing(args)) do
-        raise "not supported"
-      end
-    end
-
-    def from_binary(tensor, binary, opts) do
-      key = Keyword.fetch!(opts, :key)
-      Process.put(key, binary)
-      put_in(tensor.data, %__MODULE__{key: key})
-    end
-
-    def backend_deallocate(%Nx.Tensor{data: %__MODULE__{key: key}}) do
-      if Process.delete(key) do
-        :ok
-      else
-        :already_deallocated
-      end
-    end
-  end
-
-  describe "tensor" do
-    test "transfers new tensor" do
-      Nx.tensor([1, 2, 3], backend: {ProcessBackend, key: :example})
-      assert Process.get(:example) == <<1::64-native, 2::64-native, 3::64-native>>
-    end
-  end
-
   describe "backend_transfer" do
     test "transfers existing tensor" do
       Nx.tensor([1, 2, 3]) |> Nx.backend_transfer({ProcessBackend, key: :example})
-      assert Process.get(:example) == <<1::64-native, 2::64-native, 3::64-native>>
+      assert Process.get(:example) == <<1::32-native, 2::32-native, 3::32-native>>
     end
   end
 
   describe "backend_copy" do
     test "copies existing tensor" do
       Nx.tensor([1, 2, 3]) |> Nx.backend_copy({ProcessBackend, key: :example})
-      assert Process.get(:example) == <<1::64-native, 2::64-native, 3::64-native>>
+      assert Process.get(:example) == <<1::32-native, 2::32-native, 3::32-native>>
     end
   end
 
   describe "backend_deallocate" do
     test "deallocates existing tensor" do
       t = Nx.tensor([1, 2, 3]) |> Nx.backend_transfer({ProcessBackend, key: :example})
-      assert Process.get(:example) == <<1::64-native, 2::64-native, 3::64-native>>
+      assert Process.get(:example) == <<1::32-native, 2::32-native, 3::32-native>>
       assert Nx.backend_deallocate(t) == :ok
       refute Process.get(:example)
       assert Nx.backend_deallocate(t) == :already_deallocated
@@ -118,13 +82,47 @@ defmodule Nx.TensorTest do
     test "on iota" do
       assert_raise RuntimeError, "not supported", fn -> Nx.iota({2, 2}) end
     end
+  end
 
-    test "on random_normal" do
-      assert_raise RuntimeError, "not supported", fn -> Nx.random_normal({2, 2}) end
+  describe "access" do
+    test "works with stepped ranges" do
+      assert Nx.iota({2, 3, 5})[[.., 0..-1//3, 0..-1//2]] ==
+               Nx.tensor([
+                 [
+                   [0, 2, 4]
+                 ],
+                 [
+                   [15, 17, 19]
+                 ]
+               ])
+
+      assert Nx.iota({2, 3, 5})[[.., 0..-1//2, 0..-1//2]] ==
+               Nx.tensor([
+                 [
+                   [0, 2, 4],
+                   [10, 12, 14]
+                 ],
+                 [
+                   [15, 17, 19],
+                   [25, 27, 29]
+                 ]
+               ])
     end
 
-    test "on random_uniform" do
-      assert_raise RuntimeError, "not supported", fn -> Nx.random_uniform({2, 2}) end
+    test "raises for negative steps" do
+      iota = Nx.iota({2, 5})
+      base_message = "range step must be positive, got range: 4..0//-2"
+
+      assert_raise ArgumentError, base_message, fn ->
+        iota[[0, 4..0//-2]]
+      end
+
+      message =
+        "range step must be positive, got range: 1..-1//-1. Did you mean to pass the range 1..-1//1 instead?"
+
+      assert_raise ArgumentError, message, fn ->
+        iota[[1, 1..-1//-1]]
+      end
     end
   end
 end

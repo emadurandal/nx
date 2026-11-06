@@ -3,10 +3,13 @@ defmodule Torchx.NxDoctestTest do
   Import Nx' doctest and run them on the Torchx backend.
 
   Many tests are excluded for the reasons below, coverage
-  for the excluded tests can be found on Torchx.BackendTest.
-  """
+  for the excluded tests can be found on Torchx.NxTest.
 
-  # TODO: Add backend tests for the doctests that are excluded
+  `Nx.fft2/2`, `Nx.ifft2/2`, `Nx.rfft/2`, and `Nx.irfft/2` are implemented via `Nx.block/4`.
+  Doctest expectations are written for `Nx.BinaryBackend` string `inspect/1` output;
+  LibTorch can produce signed zeros so complex `inspect` differs.
+  Those doctests are excluded here; see `Torchx.NxBlockTest` for numerical checks.
+  """
 
   use ExUnit.Case, async: true
 
@@ -15,58 +18,52 @@ defmodule Torchx.NxDoctestTest do
     :ok
   end
 
-  @temporarily_broken_doctests [
-    # argmax - tie_break option not supported
-    argmax: 2,
-    # argmin - tie_break option not supported
-    argmin: 2,
-    # broadcast - shape mismatch in one test
-    broadcast: 3,
-    # dot - Batching not supported
-    dot: 6,
-    # mean - Torchx expects a input tensor but receives a number as input
-    mean: 2,
-    # outer - shape mismatch in some tests
-    outer: 2,
-    # quotient - Torchx expects a input tensor but receives a number as input
-    quotient: 2,
-    # slice - expects numerical start indices, but now receives tensors,
-    slice: 4,
-    # slice_axis - expects scalar starts and receives tensors
-    slice_axis: 5,
-    # stack - fails in some tests
-    stack: 2,
-    # window_mean - depends on window_sum which is not implemented
-    window_mean: 3,
-    # require Elixir 1.13+
-    sigil_M: 2,
-    sigil_V: 2
-  ]
-
   @rounding_error_doctests [
-    atanh: 1,
-    ceil: 1,
-    cos: 1,
-    cosh: 1,
+    acos: 1,
+    sqrt: 1,
     erfc: 1,
     erf_inv: 1,
     round: 1,
-    logistic: 1
+    fft: 2,
+    ifft: 2,
+    fft2: 2,
+    ifft2: 2,
+    rfft: 2,
+    irfft: 2,
+    expm1: 1,
+    standard_deviation: 2
+  ]
+
+  if Application.compile_env(:torchx, :is_apple_arm64) do
+    @os_rounding_error_doctests [sin: 1, erf: 1]
+  else
+    case :os.type() do
+      {:win32, _} -> @os_rounding_error_doctests [expm1: 1, erf: 1]
+      _ -> @os_rounding_error_doctests []
+    end
+  end
+
+  @unrelated_doctests [
+    default_backend: 1
   ]
 
   @inherently_unsupported_doctests [
-    # bitcast - no API available
-    bitcast: 2,
-    # default_backend - specific to BinaryBackend
-    default_backend: 1
+    # as_type - the rules change per type
+    as_type: 2,
+    # no API available - bit based
+    count_leading_zeros: 1,
+    population_count: 1,
+    # no API available - function based
+    map: 3,
+    window_reduce: 5,
+    reduce: 4
   ]
 
   doctest Nx,
     except:
-      Torchx.Backend.__unimplemented__()
-      |> Enum.map(fn {fun, arity} -> {fun, arity - 1} end)
-      |> Kernel.++(@temporarily_broken_doctests)
-      |> Kernel.++(@rounding_error_doctests)
+      @rounding_error_doctests
+      |> Kernel.++(@os_rounding_error_doctests)
       |> Kernel.++(@inherently_unsupported_doctests)
+      |> Kernel.++(@unrelated_doctests)
       |> Kernel.++([:moduledoc])
 end

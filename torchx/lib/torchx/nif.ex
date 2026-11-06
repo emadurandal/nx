@@ -3,7 +3,15 @@ defmodule Torchx.NIF do
   @on_load :__on_load__
 
   def __on_load__ do
-    path = :filename.join(:code.priv_dir(:torchx), 'torchx')
+    case :os.type() do
+      {:win32, _} ->
+        Torchx.NIF.DLLLoader.setup()
+
+      _ ->
+        :ok
+    end
+
+    path = :filename.join(:code.priv_dir(:torchx), ~c"torchx")
     :erlang.load_nif(path, 0)
   end
 
@@ -15,10 +23,12 @@ defmodule Torchx.NIF do
       do: :erlang.nif_error(:undef)
   end
 
+  def mps_is_available(), do: :erlang.nif_error(:undef)
   def cuda_is_available(), do: :erlang.nif_error(:undef)
   def cuda_device_count(), do: :erlang.nif_error(:undef)
 
   def scalar_type(_tensor), do: :erlang.nif_error(:undef)
   def shape(_tensor), do: :erlang.nif_error(:undef)
   def nbytes(_tensor), do: :erlang.nif_error(:undef)
+  def to_pointer(_tensor, _mode, _permissions), do: :erlang.nif_error(:undef)
 end

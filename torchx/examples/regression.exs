@@ -3,21 +3,20 @@ defmodule LinReg do
 
   # y = mx + b
   defn init_random_params do
-    m = Nx.random_normal({1, 1}, 0.0, 0.1)
-    b = Nx.random_normal({1}, 0.0, 0.1)
+    key = Nx.Random.key(42)
+    {m, new_key} = Nx.Random.normal(key, 0.0, 0.1, shape: {1, 1})
+    {b, _new_key} = Nx.Random.normal(new_key, 0.0, 0.1, shape: {1})
     {m, b}
   end
 
   defn predict({m, b}, inp) do
-    inp
-    |> Nx.dot(m)
-    |> Nx.add(b)
+    Nx.dot(inp, m) + b
   end
 
   # MSE Loss
   defn loss({m, b}, inp, tar) do
     preds = predict({m, b}, inp)
-    Nx.mean(Nx.power(tar - preds, 2))
+    Nx.mean(Nx.pow(tar - preds, 2))
   end
 
   defn update({m, b} = params, inp, tar, step) do
@@ -64,13 +63,13 @@ trained_m =
   trained_m
   |> Nx.squeeze()
   |> Nx.backend_transfer()
-  |> Nx.to_scalar()
+  |> Nx.to_number()
 
 trained_b =
   trained_b
   |> Nx.squeeze()
   |> Nx.backend_transfer()
-  |> Nx.to_scalar()
+  |> Nx.to_number()
 
 IO.puts("Trained in #{time / 1_000_000} sec.")
 IO.puts("Trained m: #{trained_m} Trained b: #{trained_b}\n")

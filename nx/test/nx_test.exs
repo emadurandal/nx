@@ -1,11 +1,37 @@
 defmodule NxTest do
   use ExUnit.Case, async: true
 
-  doctest Nx, except: [sigil_M: 2, sigil_V: 2]
+  import Nx.Testing
+  import Nx, only: :sigils
 
   defp commute(a, b, fun) do
     fun.(a, b)
     fun.(b, a)
+  end
+
+  @doctypes [
+    :aggregation,
+    :backend,
+    :conversion,
+    :creation,
+    :cumulative,
+    :element,
+    :indexed,
+    :ndim,
+    :shape,
+    :type,
+    :window,
+    :vectorization
+  ]
+
+  test "defines doc metadata" do
+    {:docs_v1, _, :elixir, "text/markdown", _docs, _metadata, entries} = Code.fetch_docs(Nx)
+
+    for {{:function, name, arity}, _ann, _signature, docs, metadata} <- entries,
+        is_map(docs) or docs == :none,
+        metadata[:type] not in @doctypes do
+      flunk("invalid @doc type: #{inspect(metadata[:type])} for #{name}/#{arity}")
+    end
   end
 
   describe "binary broadcast" do
@@ -14,7 +40,7 @@ defmodule NxTest do
         t = Nx.add(a, b)
 
         assert Nx.to_binary(t) ==
-                 <<11::64-native, 21::64-native, 12::64-native, 22::64-native>>
+                 <<11::32-native, 21::32-native, 12::32-native, 22::32-native>>
 
         assert Nx.shape(t) == {2, 2}
       end)
@@ -25,7 +51,7 @@ defmodule NxTest do
         t = Nx.add(a, b)
 
         assert Nx.to_binary(t) ==
-                 <<2::64-native, 4::64-native, 4::64-native, 6::64-native>>
+                 <<2::32-native, 4::32-native, 4::32-native, 6::32-native>>
 
         assert Nx.shape(t) == {2, 2}
       end)
@@ -42,8 +68,8 @@ defmodule NxTest do
         assert Nx.shape(t) == {2, 2, 2}
 
         assert Nx.to_binary(t) ==
-                 <<11::64-native, 12::64-native, 21::64-native, 22::64-native, 13::64-native,
-                   14::64-native, 23::64-native, 24::64-native>>
+                 <<11::32-native, 12::32-native, 21::32-native, 22::32-native, 13::32-native,
+                   14::32-native, 23::32-native, 24::32-native>>
       end)
     end
 
@@ -58,14 +84,14 @@ defmodule NxTest do
         assert Nx.shape(t) == {4, 3, 3}
 
         assert Nx.to_binary(t) ==
-                 <<101::64-native, 102::64-native, 103::64-native, 201::64-native, 202::64-native,
-                   203::64-native, 301::64-native, 302::64-native, 303::64-native, 104::64-native,
-                   105::64-native, 106::64-native, 204::64-native, 205::64-native, 206::64-native,
-                   304::64-native, 305::64-native, 306::64-native, 107::64-native, 108::64-native,
-                   109::64-native, 207::64-native, 208::64-native, 209::64-native, 307::64-native,
-                   308::64-native, 309::64-native, 110::64-native, 111::64-native, 112::64-native,
-                   210::64-native, 211::64-native, 212::64-native, 310::64-native, 311::64-native,
-                   312::64-native>>
+                 <<101::32-native, 102::32-native, 103::32-native, 201::32-native, 202::32-native,
+                   203::32-native, 301::32-native, 302::32-native, 303::32-native, 104::32-native,
+                   105::32-native, 106::32-native, 204::32-native, 205::32-native, 206::32-native,
+                   304::32-native, 305::32-native, 306::32-native, 107::32-native, 108::32-native,
+                   109::32-native, 207::32-native, 208::32-native, 209::32-native, 307::32-native,
+                   308::32-native, 309::32-native, 110::32-native, 111::32-native, 112::32-native,
+                   210::32-native, 211::32-native, 212::32-native, 310::32-native, 311::32-native,
+                   312::32-native>>
       end)
     end
 
@@ -80,8 +106,8 @@ defmodule NxTest do
         assert Nx.shape(t) == {1, 2, 2, 2}
 
         assert Nx.to_binary(t) ==
-                 <<11::64-native, 12::64-native, 21::64-native, 22::64-native, 33::64-native,
-                   34::64-native, 43::64-native, 44::64-native>>
+                 <<11::32-native, 12::32-native, 21::32-native, 22::32-native, 33::32-native,
+                   34::32-native, 43::32-native, 44::32-native>>
       end)
     end
 
@@ -96,10 +122,10 @@ defmodule NxTest do
         assert Nx.shape(t) == {2, 2, 2, 2}
 
         assert Nx.to_binary(t) ==
-                 <<11::64-native, 12::64-native, 21::64-native, 22::64-native, 31::64-native,
-                   32::64-native, 41::64-native, 42::64-native, 13::64-native, 14::64-native,
-                   23::64-native, 24::64-native, 33::64-native, 34::64-native, 43::64-native,
-                   44::64-native>>
+                 <<11::32-native, 12::32-native, 21::32-native, 22::32-native, 31::32-native,
+                   32::32-native, 41::32-native, 42::32-native, 13::32-native, 14::32-native,
+                   23::32-native, 24::32-native, 33::32-native, 34::32-native, 43::32-native,
+                   44::32-native>>
       end)
     end
 
@@ -111,8 +137,8 @@ defmodule NxTest do
         t = Nx.add(a, b)
 
         assert Nx.to_binary(t) ==
-                 <<11::64-native, 12::64-native, 21::64-native, 22::64-native, 33::64-native,
-                   34::64-native, 43::64-native, 44::64-native>>
+                 <<11::32-native, 12::32-native, 21::32-native, 22::32-native, 33::32-native,
+                   34::32-native, 43::32-native, 44::32-native>>
 
         assert Nx.shape(t) == {2, 2, 2}
       end)
@@ -317,6 +343,133 @@ defmodule NxTest do
                  type: {:f, 32}
                )
     end
+
+    test "vectorization" do
+      t =
+        Nx.tensor([
+          [
+            [
+              [0, 1, 2]
+            ]
+          ],
+          [
+            [
+              [3, 4, 5]
+            ]
+          ]
+        ])
+        |> Nx.vectorize(x: 2)
+
+      k =
+        Nx.tensor([
+          [
+            [
+              [2]
+            ]
+          ],
+          [
+            [
+              [10]
+            ]
+          ]
+        ])
+
+      # same vectorized axis case
+      assert Nx.conv(t, Nx.vectorize(k, x: 2)) ==
+               Nx.tensor([
+                 [
+                   [
+                     [0.0, 2.0, 4.0]
+                   ]
+                 ],
+                 [
+                   [
+                     [30.0, 40.0, 50.0]
+                   ]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2)
+
+      # cross-product case
+      assert Nx.conv(t, Nx.vectorize(Nx.reshape(k, {1, 2, 1, 1, 1}), z: 1, y: 2)) ==
+               Nx.tensor([
+                 [
+                   [
+                     [
+                       [
+                         [0.0, 2.0, 4.0]
+                       ]
+                     ],
+                     [
+                       [
+                         [0.0, 10.0, 20.0]
+                       ]
+                     ]
+                   ]
+                 ],
+                 [
+                   [
+                     [
+                       [
+                         [6.0, 8.0, 10.0]
+                       ]
+                     ],
+                     [
+                       [
+                         [30.0, 40.0, 50.0]
+                       ]
+                     ]
+                   ]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, z: 1, y: 2)
+
+      # vectorized tensor and devec kernel
+      assert Nx.conv(t, k[0]) ==
+               Nx.tensor([
+                 [
+                   [
+                     [0.0, 2.0, 4.0]
+                   ]
+                 ],
+                 [
+                   [
+                     [6.0, 8.0, 10.0]
+                   ]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2)
+
+      # devec tensor and vectorized kernel
+      assert Nx.conv(Nx.devectorize(t)[0], Nx.vectorize(k, x: 2)) ==
+               Nx.tensor([
+                 [
+                   [
+                     [0.0, 2.0, 4.0]
+                   ]
+                 ],
+                 [
+                   [
+                     [0.0, 10.0, 20.0]
+                   ]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2)
+    end
+
+    test "vectorization - batch_group_size" do
+      # get and assert the expected base shape for the output
+      assert %{shape: {1, 3, 1, 1}} =
+               Nx.conv(Nx.iota({3, 10, 1, 1}), Nx.iota({3, 10, 1, 1}), batch_group_size: 3)
+
+      # using 2, 5 and 7 as vectorized sizes so that they have no common factor between each other
+      # and between them and the batch_group_size: 3
+      t = Nx.iota({3, 10, 1, 1}, vectorized_axes: [x: 2, y: 1, z: 7])
+      k = Nx.iota({3, 10, 1, 1}, vectorized_axes: [x: 1, y: 5, z: 7])
+
+      assert %{vectorized_axes: [x: 2, y: 5, z: 7], shape: {1, 3, 1, 1}} =
+               Nx.conv(t, k, batch_group_size: 3)
+    end
   end
 
   describe "pad" do
@@ -333,6 +486,35 @@ defmodule NxTest do
                  [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
                ])
     end
+
+    test "with a pad value of a wider type" do
+      pad_value = Nx.tensor(0.5, type: :f64)
+
+      for type <- [f: 8, f8_e4m3fn: 8, f: 16, bf: 16, f: 32, f: 64] do
+        t = Nx.tensor([1.0, 2.0], type: type)
+        assert Nx.pad(t, pad_value, [{1, 0, 0}]) == Nx.tensor([0.5, 1.0, 2.0], type: :f64)
+      end
+
+      for kind <- [:s, :u], width <- [2, 4, 8, 16, 32, 64] do
+        t = Nx.tensor([0, 1], type: {kind, width})
+        assert Nx.pad(t, 0.5, [{1, 0, 0}]) == Nx.tensor([0.5, 0.0, 1.0])
+      end
+
+      t1 = Nx.tensor(1)
+      assert Nx.pad(t1, 0.5, []) == Nx.tensor(1.0)
+
+      t2 = Nx.tensor([[1, 2], [3, 4]])
+
+      assert Nx.pad(t2, 0.5, [{1, 0, 0}, {0, 1, 1}]) ==
+               Nx.tensor([
+                 [0.5, 0.5, 0.5, 0.5],
+                 [1.0, 0.5, 2.0, 0.5],
+                 [3.0, 0.5, 4.0, 0.5]
+               ])
+
+      t3 = Nx.tensor([1, 2], type: :u8)
+      assert Nx.pad(t3, -1, [{1, 1, 0}]) == Nx.tensor([-1, 1, 2, -1], type: :s16)
+    end
   end
 
   describe "bitshift" do
@@ -346,6 +528,15 @@ defmodule NxTest do
       assert_raise ArgumentError,
                    "cannot left shift by -1",
                    fn -> Nx.left_shift(Nx.tensor(1), -1) end
+    end
+  end
+
+  describe "all_close/3" do
+    test "integer tensors with minimum signed value in tolerance bound (s8 -128)" do
+      a = Nx.tensor([[5, 6], [7, 8]], type: :s8)
+      b = Nx.tensor([[1, 2], [3, 4]], type: :s8)
+      x = Nx.left_shift(a, b)
+      assert Nx.all_close(x, x) |> Nx.to_number() == 1
     end
   end
 
@@ -461,10 +652,26 @@ defmodule NxTest do
   end
 
   describe "inspect" do
+    test "sub-byte integer tensors" do
+      assert inspect(Nx.tensor([1, 2, 3], type: {:u, 2})) == """
+             #Nx.Tensor<
+               u2[3]
+               [1, 2, 3]
+             >\
+             """
+
+      assert inspect(Nx.tensor([-1, 0, 1], type: {:s, 2})) == """
+             #Nx.Tensor<
+               s2[3]
+               [-1, 0, 1]
+             >\
+             """
+    end
+
     test "scalar" do
       assert inspect(Nx.tensor(123)) == """
              #Nx.Tensor<
-               s64
+               s32
                123
              >\
              """
@@ -473,7 +680,7 @@ defmodule NxTest do
     test "n-dimensional" do
       assert inspect(Nx.tensor([[1, 2, 3], [4, 5, 6]])) == """
              #Nx.Tensor<
-               s64[2][3]
+               s32[2][3]
                [
                  [1, 2, 3],
                  [4, 5, 6]
@@ -495,14 +702,14 @@ defmodule NxTest do
     test "limit" do
       assert inspect(Nx.tensor([1, 2]), limit: :infinity) == """
              #Nx.Tensor<
-               s64[2]
+               s32[2]
                [1, 2]
              >\
              """
 
       assert inspect(Nx.tensor([[1, 2], [3, 4]]), limit: 3) == """
              #Nx.Tensor<
-               s64[2][2]
+               s32[2][2]
                [
                  [1, 2],
                  [3, ...]
@@ -512,7 +719,7 @@ defmodule NxTest do
 
       assert inspect(Nx.tensor([[1, 2], [3, 4], [5, 6]]), limit: 3) == """
              #Nx.Tensor<
-               s64[3][2]
+               s32[3][2]
                [
                  [1, 2],
                  [3, ...],
@@ -608,17 +815,20 @@ defmodule NxTest do
              """
     end
 
-    test "cannot build an empty tensor" do
-      assert_raise(ArgumentError, "cannot build an empty tensor", fn ->
-        Nx.from_binary(<<>>, {:f, 64})
-      end)
+    test "an empty tensor" do
+      assert inspect(Nx.from_binary(<<>>, {:f, 64})) == """
+             #Nx.Tensor<
+               f64[0]
+               []
+             >\
+             """
     end
 
     test "all dimensions named" do
       assert inspect(Nx.tensor([[[1, 2, 3], [4, 5, 6], [7, 8, 9]]], names: [:batch, :x, :y])) ==
                """
                #Nx.Tensor<
-                 s64[batch: 1][x: 3][y: 3]
+                 s32[batch: 1][x: 3][y: 3]
                  [
                    [
                      [1, 2, 3],
@@ -634,7 +844,7 @@ defmodule NxTest do
       assert inspect(Nx.tensor([[[1, 2, 3], [4, 5, 6], [7, 8, 9]]], names: [:batch, nil, nil])) ==
                """
                #Nx.Tensor<
-                 s64[batch: 1][3][3]
+                 s32[batch: 1][3][3]
                  [
                    [
                      [1, 2, 3],
@@ -697,11 +907,306 @@ defmodule NxTest do
                Nx.tensor([[3, 4, 5], [6, 7, 8], [6, 7, 8]], type: {:f, 64})
     end
 
+    test "computes a same padding window max with large kernel and strides" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32})
+
+      assert Nx.window_max(t, {1, 3, 3, 1}, padding: :same, strides: [1, 2, 2, 1]) ==
+               Nx.tensor([
+                 [
+                   [[5.0], [7.0]],
+                   [[13.0], [15.0]]
+                 ]
+               ])
+    end
+
+    test "computes a same padding window max with asymmetric kernel" do
+      t = Nx.iota({1, 4, 6, 1}, type: {:f, 32})
+
+      assert Nx.window_max(t, {1, 2, 3, 1}, padding: :same, strides: [1, 2, 2, 1]) ==
+               Nx.tensor([
+                 [
+                   [[7.0], [9.0], [11.0]],
+                   [[19.0], [21.0], [23.0]]
+                 ]
+               ])
+    end
+
+    test "computes a same padding window max with kernel larger than input" do
+      t = Nx.iota({1, 2, 2, 1}, type: {:f, 32})
+
+      assert Nx.window_max(t, {1, 3, 3, 1}, padding: :same, strides: [1, 1, 1, 1]) ==
+               Nx.tensor([[[[3.0], [3.0]], [[3.0], [3.0]]]])
+    end
+
+    test "computes a same padding window max with kernel equal to input" do
+      t = Nx.iota({4, 4}, type: {:f, 32})
+
+      assert Nx.window_max(t, {4, 4}, padding: :same, strides: [2, 2]) ==
+               Nx.tensor([[10.0, 11.0], [14.0, 15.0]])
+    end
+
+    test "computes a same padding window max 1D" do
+      t = Nx.iota({8}, type: {:f, 32})
+
+      assert Nx.window_max(t, {3}, padding: :same, strides: [2]) ==
+               Nx.tensor([1.0, 3.0, 5.0, 7.0])
+    end
+
+    test "computes a same padding window max 2D" do
+      t = Nx.iota({4, 4}, type: {:f, 32})
+
+      assert Nx.window_max(t, {3, 3}, padding: :same, strides: [2, 2]) ==
+               Nx.tensor([[5.0, 7.0], [13.0, 15.0]])
+    end
+
+    test "computes a same padding window max with stride larger than kernel" do
+      t = Nx.iota({1, 6, 6, 1}, type: {:f, 32})
+
+      assert Nx.window_max(t, {1, 2, 2, 1}, padding: :same, strides: [1, 3, 3, 1]) ==
+               Nx.tensor([[[[7.0], [10.0]], [[25.0], [28.0]]]])
+    end
+
+    test "computes window min with same padding and large kernel" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32})
+
+      assert Nx.window_min(t, {1, 3, 3, 1}, padding: :same, strides: [1, 2, 2, 1]) ==
+               Nx.tensor([[[[0.0], [1.0]], [[4.0], [5.0]]]])
+    end
+
     test "computes a same padding window min f64" do
       t = Nx.iota({3, 3}, type: {:f, 64})
 
       assert Nx.window_min(t, {2, 1}, padding: :same) ==
                Nx.tensor([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]], type: {:f, 64})
+    end
+
+    test "computes window max with dilations + strides + same padding" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32})
+
+      assert Nx.window_max(t, {1, 2, 2, 1},
+               padding: :same,
+               strides: [1, 2, 2, 1],
+               window_dilations: [1, 2, 2, 1]
+             ) ==
+               Nx.tensor([[[[5.0], [7.0]], [[13.0], [15.0]]]])
+    end
+
+    test "computes window min with dilations + strides + same padding" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32})
+
+      assert Nx.window_min(t, {1, 2, 2, 1},
+               padding: :same,
+               strides: [1, 2, 2, 1],
+               window_dilations: [1, 2, 2, 1]
+             ) ==
+               Nx.tensor([[[[5.0], [5.0]], [[5.0], [5.0]]]])
+    end
+
+    test "computes window sum with dilations + strides + same padding" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32})
+
+      assert Nx.window_sum(t, {1, 2, 2, 1},
+               padding: :same,
+               strides: [1, 2, 2, 1],
+               window_dilations: [1, 2, 2, 1]
+             ) ==
+               Nx.tensor([[[[5.0], [12.0]], [[18.0], [40.0]]]])
+    end
+
+    test "computes window max with dilations + explicit asymmetric padding" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32})
+
+      assert Nx.window_max(t, {1, 2, 2, 1},
+               padding: [{0, 0}, {1, 0}, {0, 1}, {0, 0}],
+               strides: [1, 2, 2, 1],
+               window_dilations: [1, 2, 2, 1]
+             ) ==
+               Nx.tensor([[[[6.0], [6.0]], [[14.0], [14.0]]]])
+    end
+
+    test "computes window product with same padding and large kernel" do
+      t = Nx.iota({1, 4, 4, 1}, type: {:f, 32}) |> Nx.add(1)
+
+      assert Nx.window_product(t, {1, 3, 3, 1}, padding: :same, strides: [1, 2, 2, 1]) ==
+               Nx.tensor([[[[60.0], [8064.0]], [[4.914e5], [1.4902272e9]]]])
+    end
+
+    test "computes window product 2D with same padding" do
+      t = Nx.iota({4, 4}, type: {:f, 32}) |> Nx.add(1)
+
+      assert Nx.window_product(t, {3, 3}, padding: :same, strides: [2, 2]) ==
+               Nx.tensor([[60.0, 8064.0], [4.914e5, 1.4902272e9]])
+    end
+
+    test "computes window product 1D with same padding" do
+      t = Nx.iota({8}, type: {:f, 32}) |> Nx.add(1)
+
+      assert Nx.window_product(t, {3}, padding: :same, strides: [2]) ==
+               Nx.tensor([2.0, 24.0, 120.0, 336.0])
+    end
+
+    test "computes 1D window max with dilations" do
+      t = Nx.iota({8}, type: {:f, 32})
+
+      assert Nx.window_max(t, {3}, padding: :same, window_dilations: [2]) ==
+               Nx.tensor([2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 6.0, 7.0])
+    end
+
+    test "computes 1D window sum with dilations" do
+      t = Nx.iota({8}, type: {:f, 32})
+
+      assert Nx.window_sum(t, {3}, padding: :same, window_dilations: [2]) ==
+               Nx.tensor([2.0, 4.0, 6.0, 9.0, 12.0, 15.0, 10.0, 12.0])
+    end
+
+    test "computes window scatter max with same padding" do
+      t =
+        Nx.tensor([
+          [1, 2, 3, 4, 5],
+          [6, 7, 8, 9, 10],
+          [11, 12, 13, 14, 15]
+        ])
+
+      source = Nx.tensor([[1, 2], [3, 4]])
+
+      assert Nx.window_scatter_max(t, source, 0, {2, 3}, padding: :same, strides: [2, 3]) ==
+               Nx.tensor([
+                 [0, 0, 0, 0, 0],
+                 [0, 1, 0, 0, 2],
+                 [0, 3, 0, 0, 4]
+               ])
+    end
+
+    test "computes window scatter min with same padding" do
+      t =
+        Nx.tensor([
+          [1, 2, 3, 4, 5],
+          [6, 7, 8, 9, 10],
+          [11, 12, 13, 14, 15]
+        ])
+
+      source = Nx.tensor([[1, 2], [3, 4]])
+
+      assert Nx.window_scatter_min(t, source, 0, {2, 3}, padding: :same, strides: [2, 3]) ==
+               Nx.tensor([
+                 [0, 0, 2, 0, 0],
+                 [0, 0, 0, 0, 0],
+                 [0, 0, 0, 0, 0]
+               ])
+    end
+
+    test "computes window scatter max with explicit padding" do
+      t =
+        Nx.tensor([
+          [1, 2, 3, 4, 5],
+          [6, 7, 8, 9, 10],
+          [11, 12, 13, 14, 15]
+        ])
+
+      source = Nx.tensor([[1, 2, 3], [4, 5, 6]])
+
+      assert Nx.window_scatter_max(t, source, 0, {2, 3},
+               padding: [{1, 1}, {1, 1}],
+               strides: [2, 2]
+             ) ==
+               Nx.tensor([
+                 [0, 1, 0, 2, 3],
+                 [0, 0, 0, 0, 0],
+                 [0, 4, 0, 5, 6]
+               ])
+    end
+
+    test "computes window scatter max with f64" do
+      t = Nx.iota({6}, type: :f64)
+      s = Nx.iota({3}, type: :f64)
+      init = Nx.tensor(0.0, type: :f64)
+      result = Nx.window_scatter_max(t, s, init, {2}, strides: [2], padding: :valid)
+      assert Nx.type(result) == {:f, 64}
+      assert Nx.shape(result) == {6}
+    end
+
+    test "computes window scatter min with f64" do
+      t = Nx.iota({6}, type: :f64)
+      s = Nx.iota({3}, type: :f64)
+      init = Nx.tensor(0.0, type: :f64)
+      result = Nx.window_scatter_min(t, s, init, {2}, strides: [2], padding: :valid)
+      assert Nx.type(result) == {:f, 64}
+      assert Nx.shape(result) == {6}
+    end
+
+    test "computes window reduce (sum of squares) with same padding" do
+      t = Nx.iota({4, 4}, type: {:f, 32})
+
+      result =
+        Nx.window_reduce(t, 0.0, {3, 3}, [padding: :same, strides: [2, 2]], fn elem, acc ->
+          Nx.add(acc, Nx.multiply(elem, elem))
+        end)
+
+      assert result == Nx.tensor([[42.0, 124.0], [499.0, 1002.0]])
+    end
+
+    test "computes window reduce (custom sum) matches window_sum with same padding" do
+      t = Nx.iota({4, 4}, type: {:f, 32})
+
+      reduce_sum =
+        Nx.window_reduce(t, 0.0, {3, 3}, [padding: :same, strides: [2, 2]], fn elem, acc ->
+          Nx.add(acc, elem)
+        end)
+
+      window_sum = Nx.window_sum(t, {3, 3}, padding: :same, strides: [2, 2])
+      assert reduce_sum == window_sum
+    end
+
+    test "same padding produces correct output shapes for edge cases" do
+      # kernel larger than input
+      t1 = Nx.iota({2, 2}, type: {:f, 32})
+      assert Nx.shape(Nx.window_max(t1, {3, 3}, padding: :same)) == {2, 2}
+
+      # kernel much larger than input
+      t2 = Nx.iota({1, 1}, type: {:f, 32})
+      assert Nx.shape(Nx.window_max(t2, {5, 5}, padding: :same)) == {1, 1}
+
+      # stride > kernel, no padding needed when evenly divisible
+      t3 = Nx.iota({4, 4}, type: {:f, 32})
+      assert Nx.shape(Nx.window_max(t3, {2, 2}, padding: :same, strides: [2, 2])) == {2, 2}
+
+      # non-divisible dimensions
+      t4 = Nx.iota({5, 5}, type: {:f, 32})
+      assert Nx.shape(Nx.window_max(t4, {3, 3}, padding: :same, strides: [2, 2])) == {3, 3}
+
+      # dilated kernel with same padding
+      t5 = Nx.iota({4, 4}, type: {:f, 32})
+
+      assert Nx.shape(Nx.window_max(t5, {2, 2}, padding: :same, window_dilations: [2, 2])) ==
+               {4, 4}
+
+      # dilated kernel larger than input with same padding
+      t6 = Nx.iota({2, 2}, type: {:f, 32})
+
+      assert Nx.shape(Nx.window_max(t6, {2, 2}, padding: :same, window_dilations: [2, 2])) ==
+               {2, 2}
+    end
+  end
+
+  describe "put_slice" do
+    test "with mixed types and sizes" do
+      assert Nx.put_slice(Nx.tensor([0.0, 0.0]), [0], Nx.tensor([1])) == Nx.tensor([1.0, 0.0])
+    end
+
+    test "start indices length reports the shape and the indices" do
+      assert_raise ArgumentError,
+                   ~r/start indices for put_slice of shape \{2, 3\}.*got: \[0\]/,
+                   fn ->
+                     Nx.put_slice(Nx.iota({2, 3}), [0], Nx.iota({1, 1}))
+                   end
+    end
+
+    test "slice rank mismatch reports both shapes" do
+      assert_raise ArgumentError,
+                   ~r/slice shape \{3\}.*shape \{2, 3\}/,
+                   fn ->
+                     Nx.put_slice(Nx.iota({2, 3}), [0, 0], Nx.iota({3}))
+                   end
     end
   end
 
@@ -731,8 +1236,220 @@ defmodule NxTest do
       tensor = Nx.tensor([[1, 2, 3]], names: [:x, :y])
 
       assert_raise ArgumentError,
-                   ~r"slicing a tensor requires a non-empty range with a step of 1, got: 2..1//-1",
-                   fn -> tensor[[y: 2..1]] end
+                   ~r"slicing a tensor requires a non-empty range, got: 2..1//1",
+                   fn -> tensor[[y: 2..1//1]] end
+    end
+  end
+
+  describe "indexed_add" do
+    test "property" do
+      n = 5
+
+      indices =
+        Nx.tensor(
+          for row <- 0..(n - 1), col <- 0..(n - 1) do
+            [row, col]
+          end
+        )
+
+      updates = List.duplicate(1, n * n) |> Nx.tensor()
+
+      assert Nx.broadcast(1, {5, 5}) ==
+               0 |> Nx.broadcast({5, 5}) |> Nx.indexed_add(indices, updates)
+
+      indices =
+        Nx.tensor(
+          for row <- 0..(n - 1), col <- 0..(n - 1) do
+            [0, row, col]
+          end
+        )
+
+      assert Nx.broadcast(1, {1, 5, 5}) ==
+               0 |> Nx.broadcast({1, 5, 5}) |> Nx.indexed_add(indices, updates)
+    end
+
+    test "single-index regression" do
+      n = 5
+
+      # 1D case
+      zeros = List.duplicate(0, n)
+      upd = Nx.tensor([1])
+
+      for i <- 0..(n - 1) do
+        result = Nx.tensor(List.replace_at(zeros, i, 1))
+
+        assert result == Nx.indexed_add(Nx.tensor(zeros), Nx.tensor([[i]]), upd)
+      end
+
+      # 2D case
+      zeros = List.duplicate(zeros, n)
+
+      for i <- 0..(n - 1) do
+        result =
+          Nx.tensor(
+            List.update_at(
+              zeros,
+              i,
+              fn row ->
+                List.update_at(row, i, fn _ -> 1 end)
+              end
+            )
+          )
+
+        assert result == Nx.indexed_add(Nx.tensor(zeros), Nx.tensor([[i, i]]), upd)
+      end
+    end
+
+    test "raises when out of bounds" do
+      t = Nx.tensor([[1, 2], [3, 4]])
+
+      assert_raise ArgumentError, "index 3 is out of bounds for axis 0 in shape {2, 2}", fn ->
+        Nx.indexed_add(t, Nx.tensor([[3, -10]]), Nx.tensor([1]))
+      end
+
+      assert_raise ArgumentError, "index -1 is out of bounds for axis 1 in shape {2, 2}", fn ->
+        Nx.indexed_add(t, Nx.tensor([[0, -1]]), Nx.tensor([1]))
+      end
+    end
+
+    test "complex regression" do
+      # BinaryBackend used to break on Enum.sum over a complex-valued list
+      assert Nx.tensor([1, 2], type: {:c, 64}) ==
+               Nx.indexed_add(
+                 Nx.broadcast(0, {2}),
+                 Nx.tensor([[1], [0]]),
+                 Nx.tensor([Complex.new(2), 1])
+               )
+    end
+
+    test "vectorized target and non-vectorized index" do
+      t = Nx.tensor([[0, 1, 2], [3, 4, 5]]) |> Nx.vectorize(x: 2)
+      index = Nx.tensor([[0], [1], [1], [0]])
+      updates = Nx.tensor([1, 2, 3, 4])
+
+      assert Nx.indexed_add(t, index, updates) ==
+               Nx.tensor([
+                 [5, 6, 2],
+                 [8, 9, 5]
+               ])
+               |> Nx.vectorize(x: 2)
+    end
+
+    test "non-vectorized target and vectorized index+updates" do
+      t = Nx.tensor([0, 1, 2])
+
+      assert %{shape: {2, 1}} =
+               index =
+               Nx.tensor([
+                 [0, 0],
+                 [0, 1],
+                 [1, 0],
+                 [1, 1]
+               ])
+               |> Nx.reshape({2, 2, 2, 1})
+               |> Nx.vectorize(x: 2, y: 2)
+
+      updates =
+        Nx.tensor([
+          [1, 2],
+          [3, 4]
+        ])
+        |> Nx.vectorize(x: 2)
+
+      assert Nx.indexed_add(t, index, updates) ==
+               Nx.tensor([
+                 [
+                   [3, 1, 2],
+                   [1, 3, 2]
+                 ],
+                 [
+                   [4, 4, 2],
+                   [0, 8, 2]
+                 ]
+               ])
+               |> Nx.vectorize(x: 2, y: 2)
+    end
+  end
+
+  describe "indexed_put" do
+    test "property" do
+      n = 5
+
+      indices =
+        Nx.tensor(
+          for row <- 0..(n - 1), col <- 0..(n - 1) do
+            [row, col]
+          end
+        )
+
+      updates = List.duplicate(1, n * n) |> Nx.tensor()
+
+      assert Nx.broadcast(1, {5, 5}) ==
+               0 |> Nx.broadcast({5, 5}) |> Nx.indexed_put(indices, updates)
+
+      indices =
+        Nx.tensor(
+          for row <- 0..(n - 1), col <- 0..(n - 1) do
+            [0, row, col]
+          end
+        )
+
+      assert Nx.broadcast(1, {1, 5, 5}) ==
+               0 |> Nx.broadcast({1, 5, 5}) |> Nx.indexed_put(indices, updates)
+    end
+
+    test "single-index regression" do
+      n = 5
+
+      # 1D case
+      zeros = List.duplicate(0, n)
+      upd = Nx.tensor([1])
+
+      for i <- 0..(n - 1) do
+        result = Nx.tensor(List.replace_at(zeros, i, 1))
+
+        assert result == Nx.indexed_put(Nx.tensor(zeros), Nx.tensor([[i]]), upd)
+      end
+
+      # 2D case
+      zeros = List.duplicate(zeros, n)
+
+      for i <- 0..(n - 1) do
+        result =
+          Nx.tensor(
+            List.update_at(
+              zeros,
+              i,
+              fn row ->
+                List.update_at(row, i, fn _ -> 1 end)
+              end
+            )
+          )
+
+        assert result == Nx.indexed_put(Nx.tensor(zeros), Nx.tensor([[i, i]]), upd)
+      end
+    end
+
+    test "raises when out of bounds" do
+      t = Nx.tensor([[1, 2], [3, 4]])
+
+      assert_raise ArgumentError, "index 3 is out of bounds for axis 0 in shape {2, 2}", fn ->
+        Nx.indexed_put(t, Nx.tensor([[3, -10]]), Nx.tensor([1]))
+      end
+
+      assert_raise ArgumentError, "index -1 is out of bounds for axis 1 in shape {2, 2}", fn ->
+        Nx.indexed_put(t, Nx.tensor([[0, -1]]), Nx.tensor([1]))
+      end
+    end
+
+    test "complex regression" do
+      # BinaryBackend used to break on Enum.sum over a complex-valued list
+      assert Nx.tensor([1, 2], type: {:c, 64}) ==
+               Nx.indexed_put(
+                 Nx.broadcast(0, {2}),
+                 Nx.tensor([[1], [0]]),
+                 Nx.tensor([Complex.new(2), 1])
+               )
     end
   end
 
@@ -758,6 +1475,34 @@ defmodule NxTest do
       assert Nx.reshape(t, {2, 2}, names: [:x, :y]) ==
                Nx.tensor([[1, 2], [3, 4]], names: [:x, :y])
     end
+
+    test "raises ArgumentError for more than one :auto dimension" do
+      assert_raise ArgumentError,
+                   "only a single :auto dimension is allowed in reshape, got: {:auto, :auto}",
+                   fn -> Nx.reshape(Nx.iota({12}), {:auto, :auto}) end
+    end
+  end
+
+  describe "flatten" do
+    test "returns a flattened tensor given a N-Dimensional tensor" do
+      t = Nx.iota({3, 3, 3})
+
+      assert Nx.flatten(t) |> Nx.shape() == {Nx.size(t)}
+    end
+
+    test "returns a flattened tensor given N-Dimensional tensor with axes" do
+      t = Nx.iota({1, 2, 3, 4, 5, 6})
+
+      expected = Nx.iota({1, 2, 60, 6})
+
+      assert expected == Nx.flatten(t, axes: [2, 3, 4])
+    end
+
+    test "returns tensor unchanged given a 1 Dimensional tensor" do
+      t = Nx.iota({10})
+
+      assert Nx.flatten(t) == t
+    end
   end
 
   describe "broadcast" do
@@ -767,17 +1512,69 @@ defmodule NxTest do
       assert Nx.broadcast(t, {2, 2}, names: [:x, :y]) ==
                Nx.tensor([[1, 2], [3, 4]], names: [:x, :y])
     end
+
+    test "axes length mismatch reports both shapes and the axes" do
+      assert_raise ArgumentError,
+                   ~r/axes \[0\].*shape \{2, 2\}.*broadcasting to \{2, 2, 2\}/,
+                   fn ->
+                     Nx.broadcast(Nx.iota({2, 2}), {2, 2, 2}, axes: [0])
+                   end
+    end
+  end
+
+  describe "fill/3" do
+    test "creates an integer value in the type of the result" do
+      t = Nx.tensor([1, 2], type: :s64)
+      assert Nx.fill(t, 2 ** 40) == Nx.tensor([2 ** 40, 2 ** 40], type: :s64)
+    end
   end
 
   describe "tensor/2" do
-    test "raises for empty list" do
-      assert_raise(RuntimeError, "cannot build empty tensor", fn ->
-        Nx.tensor([])
-      end)
+    test "with non-finite" do
+      assert Nx.tensor(:neg_infinity) == Nx.Constants.neg_infinity()
+      assert Nx.tensor(:infinity) == Nx.Constants.infinity()
+      assert Nx.tensor(:nan) == Nx.Constants.nan()
+    end
+
+    test "keeps integers at the bounds of the type" do
+      for {value, type} <- [{2 ** 31 - 1, :s32}, {-(2 ** 31), :s32}, {255, :u8}, {0, :u8}] do
+        assert Nx.to_number(Nx.tensor(value, type: type)) == value
+      end
+
+      assert Nx.type(Nx.tensor([2 ** 31 - 1, -(2 ** 31)])) == {:s, 32}
+    end
+
+    test "raises when an integer does not fit the type" do
+      assert_raise ArgumentError,
+                   "the integer 2147483648 does not fit in the type :s32, pass type: :s64 to hold it",
+                   fn -> Nx.tensor(2 ** 31) end
+
+      assert_raise ArgumentError, ~r/the integer -2147483649 does not fit in the type :s32/, fn ->
+        Nx.tensor([1, -(2 ** 31) - 1])
+      end
+
+      assert_raise ArgumentError, ~r/the integer 256 does not fit in the type :u8/, fn ->
+        Nx.tensor(256, type: :u8)
+      end
+
+      assert_raise ArgumentError, ~r/the integer -1 does not fit in the type :u32/, fn ->
+        Nx.tensor([0, -1], type: :u32)
+      end
+
+      assert_raise ArgumentError,
+                   ~r/the integer 1099511627776 does not fit in the type :s32/,
+                   fn ->
+                     Nx.Defn.jit(fn -> 2 ** 40 end).()
+                   end
+    end
+
+    test "builds a zero-size f32 tensor from an empty list" do
+      assert Nx.shape(Nx.tensor([])) == {0}
+      assert Nx.type(Nx.tensor([])) == {:f, 32}
     end
 
     test "raises for non-numeric list" do
-      assert_raise(ArgumentError, "cannot infer the numerical type of :error", fn ->
+      assert_raise(ArgumentError, "invalid value given to Nx.tensor/1, got: :error", fn ->
         Nx.tensor([:error])
       end)
     end
@@ -791,35 +1588,53 @@ defmodule NxTest do
       end)
     end
 
-    test "raises for improper list" do
-      assert_raise(FunctionClauseError, ~r/reduce\/3/, fn ->
-        Nx.tensor([1 | 1])
-      end)
+    test "raises with tensor and different backends" do
+      assert_raise ArgumentError,
+                   "Nx.tensor/2 wants to allocate on backend ProcessBackend but it was given a tensor allocated on Nx.BinaryBackend",
+                   fn ->
+                     Nx.tensor(Nx.tensor([1, 2, 3], backend: Nx.BinaryBackend),
+                       backend: ProcessBackend
+                     )
+                   end
     end
   end
 
   describe "from_binary/3" do
-    test "raises for empty bitstring" do
-      assert_raise(ArgumentError, "cannot build an empty tensor", fn ->
-        Nx.from_binary("", {:u, 32})
-      end)
+    test "builds a zero-size tensor from an empty bitstring" do
+      assert Nx.shape(Nx.from_binary("", {:u, 32})) == {0}
+    end
+
+    test "round-trips sub-byte tensors whose binary is not byte-aligned" do
+      for {type, values} <- [
+            {{:u, 2}, [1, 2, 3]},
+            {{:u, 4}, [5, 10, 15]},
+            {{:s, 2}, [-1, 0, 1]}
+          ] do
+        tensor = Nx.tensor(values, type: type)
+        data = Nx.to_binary(tensor)
+
+        refute is_binary(data)
+        assert Nx.from_binary(data, type) == tensor
+      end
     end
   end
 
-  describe "to_batched_list/2" do
+  describe "to_batched/3" do
     test "works for all batch sizes less than or equal to {n, ...}" do
       for rows <- 1..10, cols <- 1..10, batch_size <- 1..rows do
         t = Nx.iota({rows, cols})
 
-        batches = Nx.to_batched_list(t, batch_size, leftover: :discard)
-        assert length(batches) == div(rows, batch_size)
+        batches = Nx.to_batched(t, batch_size, leftover: :discard)
+        refute is_list(batches)
+        assert Enum.count(batches) == div(rows, batch_size)
 
-        batches = Nx.to_batched_list(t, batch_size, leftover: :repeat)
+        batches = Nx.to_batched(t, batch_size, leftover: :repeat)
+        refute is_list(batches)
 
         if rem(rows, batch_size) == 0 do
-          assert length(batches) == div(rows, batch_size)
+          assert Enum.count(batches) == div(rows, batch_size)
         else
-          assert length(batches) == div(rows, batch_size) + 1
+          assert Enum.count(batches) == div(rows, batch_size) + 1
         end
       end
     end
@@ -827,9 +1642,29 @@ defmodule NxTest do
     test "raises for scalars" do
       t = Nx.tensor(1)
 
-      assert_raise(ArgumentError, ~r/cannot batch scalar tensor/, fn ->
-        Nx.to_batched_list(t, 1)
+      assert_raise(ArgumentError, ~r/cannot batch non-vectorized scalar tensor/, fn ->
+        Nx.to_batched(t, 1)
       end)
+    end
+  end
+
+  describe "compatible?/2" do
+    test "non-composite types" do
+      refute Nx.compatible?(Complex.new(0, 2), 2)
+      refute Nx.compatible?(2, Complex.new(0, 2))
+      refute Nx.compatible?(Complex.new(0, 2), ~VEC[2])
+      refute Nx.compatible?(~VEC[2], Complex.new(0, 2))
+      refute Nx.compatible?(2, ~VEC[2i])
+      refute Nx.compatible?(~VEC[2i], 2)
+      refute Nx.compatible?(~VEC[2], ~VEC[2i])
+      assert Nx.compatible?(Complex.new(2), Complex.new(0, 2))
+      assert Nx.compatible?(2, 0)
+    end
+
+    test "structs" do
+      args = {1, Complex.new(1), Nx.tensor(1)}
+      c = %Container{a: args, b: args}
+      assert Nx.compatible?(c, c)
     end
   end
 
@@ -853,7 +1688,7 @@ defmodule NxTest do
       end)
     end
 
-    test "the new axis can shift the exising axes to the left" do
+    test "the new axis can shift the existing axes to the left" do
       t = Nx.tensor([1, 2, 3], names: [:x])
       t = Nx.new_axis(t, 0, :batch)
       assert t.shape == {1, 3}
@@ -863,7 +1698,7 @@ defmodule NxTest do
 
   describe "pad/3" do
     test "raises for non-scalar pad value" do
-      assert_raise(ArgumentError, "padding value must be a scalar", fn ->
+      assert_raise(ArgumentError, "padding value must be a scalar and non-vectorized", fn ->
         Nx.pad(Nx.tensor(1), Nx.tensor([0]), [])
       end)
     end
@@ -900,6 +1735,40 @@ defmodule NxTest do
   end
 
   describe "reduce_min/2" do
+    test "works with non finites" do
+      t =
+        Nx.tensor([
+          [:neg_infinity, :infinity, 1],
+          [:neg_infinity, :nan, 1],
+          [:neg_infinity, :neg_infinity, 1],
+          [:neg_infinity, 0, 1],
+          [:infinity, :infinity, 1],
+          [:infinity, :nan, 1],
+          [:infinity, :neg_infinity, 1],
+          [:infinity, 0, 1],
+          [:nan, :infinity, 1],
+          [:nan, :nan, 1],
+          [:nan, :neg_infinity, 1],
+          [:nan, 0, 1]
+        ])
+
+      assert Nx.reduce_min(t, axes: [1]) ==
+               Nx.tensor([
+                 :neg_infinity,
+                 :nan,
+                 :neg_infinity,
+                 :neg_infinity,
+                 1,
+                 :nan,
+                 :neg_infinity,
+                 0,
+                 :nan,
+                 :nan,
+                 :nan,
+                 :nan
+               ])
+    end
+
     test "removes all axes (scalar) when no axes are specified" do
       t = Nx.tensor([[1, 2, 3], [3, 1, 2]])
       out1 = Nx.reduce_min(t)
@@ -930,7 +1799,69 @@ defmodule NxTest do
     end
   end
 
+  describe "reduce_max/2" do
+    test "works with non finites" do
+      t =
+        Nx.tensor([
+          [:neg_infinity, :infinity, 1],
+          [:neg_infinity, :nan, 1],
+          [:neg_infinity, :neg_infinity, 1],
+          [:neg_infinity, 0, 1],
+          [:infinity, :infinity, 1],
+          [:infinity, :nan, 1],
+          [:infinity, :neg_infinity, 1],
+          [:infinity, 0, 1],
+          [:nan, :infinity, 1],
+          [:nan, :nan, 1],
+          [:nan, :neg_infinity, 1],
+          [:nan, 0, 1]
+        ])
+
+      assert Nx.reduce_max(t, axes: [1]) ==
+               Nx.tensor([
+                 :infinity,
+                 :nan,
+                 1,
+                 1,
+                 :infinity,
+                 :nan,
+                 :infinity,
+                 :infinity,
+                 :nan,
+                 :nan,
+                 :nan,
+                 :nan
+               ])
+    end
+
+    test "reduces across trailing contiguous axes" do
+      t = Nx.iota({2, 3, 4})
+      assert_equal(Nx.reduce_max(t, axes: [2]), Nx.tensor([[3, 7, 11], [15, 19, 23]]))
+      assert_equal(Nx.reduce_max(t, axes: [1, 2]), Nx.tensor([11, 23]))
+    end
+  end
+
   describe "argmin/2" do
+    test "works with non finites" do
+      t =
+        Nx.tensor([
+          [:neg_infinity, :infinity, 1],
+          [:neg_infinity, :nan, 1],
+          [:neg_infinity, :neg_infinity, 1],
+          [:neg_infinity, 0, 1],
+          [:infinity, :infinity, 1],
+          [:infinity, :nan, 1],
+          [:infinity, :neg_infinity, 1],
+          [:infinity, 0, 1],
+          [:nan, :infinity, 1],
+          [:nan, :nan, 1],
+          [:nan, :neg_infinity, 1],
+          [:nan, 0, 1]
+        ])
+
+      assert Nx.argmin(t, axis: 1) == Nx.tensor([0, 1, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0])
+    end
+
     test "raises for invalid :tie_break option" do
       assert_raise(
         ArgumentError,
@@ -939,6 +1870,28 @@ defmodule NxTest do
           Nx.argmin(Nx.tensor(1), tie_break: :blep)
         end
       )
+    end
+  end
+
+  describe "argmax" do
+    test "works with non finites" do
+      t =
+        Nx.tensor([
+          [:neg_infinity, :infinity, 1],
+          [:neg_infinity, :nan, 1],
+          [:neg_infinity, :neg_infinity, 1],
+          [:neg_infinity, 0, 1],
+          [:infinity, :infinity, 1],
+          [:infinity, :nan, 1],
+          [:infinity, :neg_infinity, 1],
+          [:infinity, 0, 1],
+          [:nan, :infinity, 1],
+          [:nan, :nan, 1],
+          [:nan, :neg_infinity, 1],
+          [:nan, 0, 1]
+        ])
+
+      assert Nx.argmax(t, axis: 1) == Nx.tensor([1, 1, 2, 2, 0, 1, 0, 0, 0, 1, 0, 0])
     end
   end
 
@@ -977,25 +1930,25 @@ defmodule NxTest do
     end
   end
 
-  describe "reduce_window/5" do
+  describe "window_reduce/5" do
     test "works with :window_dilations option as an integer" do
       t = Nx.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
       opts = [window_dilations: 2]
-      out = Nx.reduce_window(t, 0, {2, 2}, opts, fn x, acc -> max(x, acc) end)
+      out = Nx.window_reduce(t, 0, {2, 2}, opts, fn x, acc -> Nx.max(x, acc) end)
       assert out == Nx.tensor([[9]])
     end
 
     test "works with :strides option as an integer" do
       t = Nx.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
       opts = [strides: 1]
-      out = Nx.reduce_window(t, 0, {2, 2}, opts, fn x, acc -> max(x, acc) end)
+      out = Nx.window_reduce(t, 0, {2, 2}, opts, fn x, acc -> Nx.max(x, acc) end)
       assert out == Nx.tensor([[5, 6], [8, 9]])
     end
 
     test "works with :padding option as a list of shape-matching integer tuples" do
       t = Nx.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
       opts = [padding: [{0, 0}, {0, 1}]]
-      out = Nx.reduce_window(t, 0, {2, 2}, opts, fn x, acc -> max(x, acc) end)
+      out = Nx.window_reduce(t, 0, {2, 2}, opts, fn x, acc -> Nx.max(x, acc) end)
       assert Nx.shape(out) == {2, 3}
 
       assert out ==
@@ -1013,7 +1966,7 @@ defmodule NxTest do
         ArgumentError,
         ~r/invalid padding mode specified/,
         fn ->
-          Nx.reduce_window(t, 0, {2, 2}, opts, fn x, acc -> max(x, acc) end)
+          Nx.window_reduce(t, 0, {2, 2}, opts, fn x, acc -> max(x, acc) end)
         end
       )
     end
@@ -1027,11 +1980,31 @@ defmodule NxTest do
       assert Nx.shape(out) == {1, 3}
       assert out == Nx.tensor([[3, 6, 9]])
     end
+  end
 
-    test "raises readable error on invalid inputs" do
-      assert_raise ArgumentError, "expected a %Nx.Tensor{} or a number, got: nil", fn ->
-        Nx.dot(Nx.tensor([1, 2, 3]), nil)
-      end
+  describe "dot/4" do
+    test "does not re-sort the contracting axes" do
+      left = Nx.iota({2, 7, 8, 3, 1})
+      right = Nx.iota({1, 8, 3, 7, 3})
+
+      result = Nx.dot(left, [3, 1, 2], right, [2, 3, 1])
+
+      assert {2, 1, 1, 3} == result.shape
+
+      # Expected result obtained from pytorch
+      assert result ==
+               Nx.tensor([
+                 [
+                   [
+                     [3_731_448, 3_745_476, 3_759_504]
+                   ]
+                 ],
+                 [
+                   [
+                     [10_801_560, 10_843_812, 10_886_064]
+                   ]
+                 ]
+               ])
     end
   end
 
@@ -1041,7 +2014,7 @@ defmodule NxTest do
       t2 = Nx.iota({3, 4, 2, 2})
 
       assert Nx.dot(t1, [1, 2], [0], t2, [2, 1], [0]) ==
-               Nx.tensor([[[280, 308]], [[2200, 2292]], [[6168, 6324]]])
+               Nx.tensor([[[252, 280]], [[2172, 2264]], [[6140, 6296]]])
     end
 
     test "works with multiple batch dimensions" do
@@ -1092,6 +2065,45 @@ defmodule NxTest do
     test "works with batch dimension of size 1" do
       t = Nx.tensor([[[1, 2, 3], [4, 5, 6]]])
       assert Nx.dot(t, [2], [0], t, [2], [0]) == Nx.tensor([[[14, 32], [32, 77]]])
+    end
+
+    test "vectorization regression" do
+      l = Nx.tensor([[[[0, 1, 2], [0, -1, -2]]]]) |> Nx.tile([5, 1, 1, 1]) |> Nx.vectorize(x: 5)
+
+      assert l.shape == {1, 2, 3}
+
+      r =
+        Nx.tensor([
+          [1, 1, 1, 1],
+          [2, 2, 2, 2],
+          [3, 3, 3, 3]
+        ])
+
+      assert Nx.dot(l, r) ==
+               Nx.tensor([
+                 [
+                   [8, 8, 8, 8],
+                   [-8, -8, -8, -8]
+                 ],
+                 [
+                   [8, 8, 8, 8],
+                   [-8, -8, -8, -8]
+                 ],
+                 [
+                   [8, 8, 8, 8],
+                   [-8, -8, -8, -8]
+                 ],
+                 [
+                   [8, 8, 8, 8],
+                   [-8, -8, -8, -8]
+                 ],
+                 [
+                   [8, 8, 8, 8],
+                   [-8, -8, -8, -8]
+                 ]
+               ])
+               |> Nx.vectorize(x: 5)
+               |> Nx.reshape({1, 2, 4})
     end
   end
 
@@ -1281,6 +2293,87 @@ defmodule NxTest do
       message = ~r/invalid padding/
       conv_raise_for_options(message, padding: :bad_value)
     end
+
+    test "supports complex values" do
+      # These are basically the doctest but with combinations
+      # where either the tensor or the kernel (or both)
+      # are complex-typed
+
+      types = [f: 32, c: 64]
+
+      for tensor_type <- types,
+          kernel_type <- types,
+          tensor_type != {:f, 32} or kernel_type != {:f, 32} do
+        # first doctest
+        tensor = Nx.iota({1, 1, 3, 3}, type: tensor_type)
+        kernel = Nx.iota({4, 1, 1, 1}, type: kernel_type)
+
+        expected_output =
+          Nx.tensor(
+            [
+              [
+                [
+                  [0.0, 0.0, 0.0],
+                  [0.0, 0.0, 0.0],
+                  [0.0, 0.0, 0.0]
+                ],
+                [
+                  [0.0, 1.0, 2.0],
+                  [3.0, 4.0, 5.0],
+                  [6.0, 7.0, 8.0]
+                ],
+                [
+                  [0.0, 2.0, 4.0],
+                  [6.0, 8.0, 10.0],
+                  [12.0, 14.0, 16.0]
+                ],
+                [
+                  [0.0, 3.0, 6.0],
+                  [9.0, 12.0, 15.0],
+                  [18.0, 21.0, 24.0]
+                ]
+              ]
+            ],
+            type: Nx.Type.merge(tensor_type, kernel_type)
+          )
+
+        assert_all_close(expected_output, Nx.conv(tensor, kernel, strides: [1, 1]))
+
+        # second doctest
+        tensor = Nx.iota({1, 1, 3, 3}, type: tensor_type)
+        kernel = Nx.iota({4, 1, 2, 1}, type: kernel_type)
+
+        expected_output =
+          Nx.tensor(
+            [
+              [
+                [
+                  [3.0, 5.0],
+                  [0.0, 0.0]
+                ],
+                [
+                  [9.0, 15.0],
+                  [6.0, 10.0]
+                ],
+                [
+                  [15.0, 25.0],
+                  [12.0, 20.0]
+                ],
+                [
+                  [21.0, 35.0],
+                  [18.0, 30.0]
+                ]
+              ]
+            ],
+            type: Nx.Type.merge(tensor_type, kernel_type)
+          )
+
+        assert_all_close(
+          expected_output,
+          Nx.conv(tensor, kernel, strides: 2, padding: :same, kernel_dilation: [2, 1])
+        )
+      end
+    end
   end
 
   describe "clip/3" do
@@ -1289,19 +2382,98 @@ defmodule NxTest do
       min = Nx.iota({2})
       max = 3
 
-      assert_raise(ArgumentError, "min value must be a scalar shape, got: {2}", fn ->
-        Nx.clip(t, min, max)
-      end)
+      assert_raise(
+        ArgumentError,
+        "min value must be a non-vectorized scalar shape, got shape {2} and vectorized axes []",
+        fn ->
+          Nx.clip(t, min, max)
+        end
+      )
     end
 
     test "raises when max arg is non-scalar" do
       t = Nx.iota({4})
-      min = Nx.iota(2)
+      min = Nx.iota({})
       max = Nx.iota({3})
 
-      assert_raise(ArgumentError, "max value must be a scalar shape, got: {3}", fn ->
-        Nx.clip(t, min, max)
-      end)
+      assert_raise(
+        ArgumentError,
+        "max value must be a non-vectorized scalar shape, got shape {3} and vectorized axes []",
+        fn ->
+          Nx.clip(t, min, max)
+        end
+      )
+    end
+
+    test "works with infinities" do
+      t = Nx.tensor([1.0, 2.0, 3.0])
+      assert t == Nx.clip(t, Nx.Constants.neg_infinity(), Nx.Constants.infinity())
+    end
+
+    test "propagates NaN from any argument" do
+      nan = Nx.Constants.nan()
+
+      assert Nx.clip(Nx.tensor([:nan, 1.0, 5.0]), 0.0, 2.0) == Nx.tensor([:nan, 1.0, 2.0])
+      assert Nx.clip(Nx.tensor(1.0), nan, 2.0) == nan
+      assert Nx.clip(Nx.tensor(1.0), 0.0, nan) == nan
+    end
+  end
+
+  describe "sign/1" do
+    test "returns NaN for NaN" do
+      assert Nx.sign(Nx.tensor([:nan, -2.0, 0.0, 2.0])) == Nx.tensor([:nan, -1.0, 0.0, 1.0])
+    end
+  end
+
+  describe "log2/1" do
+    test "equals log/2 with base 2" do
+      for type <- [f: 16, f: 64, c: 64] do
+        t = Nx.tensor([2, 8, 1024], type: type)
+        assert Nx.log2(t) == Nx.log(t, 2)
+      end
+    end
+  end
+
+  describe "log10/1" do
+    test "equals log/2 with base 10" do
+      for type <- [f: 16, f: 64, c: 64] do
+        t = Nx.tensor([10, 100, 1000], type: type)
+        assert Nx.log10(t) == Nx.log(t, 10)
+      end
+    end
+  end
+
+  describe "log/2" do
+    test "keeps the input tensor's type when given a number base" do
+      for type <- [f: 8, f8_e4m3fn: 8, f: 16, bf: 16, f: 32, f: 64, c: 64, c: 128] do
+        t = Nx.tensor([3, 9], type: type)
+        assert Nx.type(Nx.log(t, 3)) == type
+      end
+    end
+
+    test "keeps the input tensor's f64 precision when given a number base" do
+      t = Nx.tensor([2.0, 8.0, 1024.0], type: :f64)
+
+      assert_all_close(Nx.log(t, 2), Nx.tensor([1.0, 3.0, 10.0], type: :f64),
+        atol: 1.0e-15,
+        rtol: 1.0e-15
+      )
+    end
+
+    test "merges types with a tensor base" do
+      t = Nx.tensor([4.0, 8.0])
+      result = Nx.log(t, Nx.tensor(2.0, type: :f64))
+
+      assert Nx.type(result) == {:f, 64}
+      assert_all_close(result, Nx.tensor([2.0, 3.0], type: :f64))
+    end
+
+    test "raises for a base that is not greater than 0 and different than 1" do
+      for base <- [0, -2, 1] do
+        assert_raise ArgumentError,
+                     "expected base to be greater than 0 and different than 1, got: #{inspect(base)}",
+                     fn -> Nx.log(Nx.tensor([2.0]), base) end
+      end
     end
   end
 
@@ -1333,7 +2505,7 @@ defmodule NxTest do
     end
 
     test "raises for an empty list of tensors" do
-      assert_raise(ArgumentError, "empty list passed to concatenate", fn ->
+      assert_raise(ArgumentError, "no tensors were given to concatenate", fn ->
         Nx.concatenate([])
       end)
     end
@@ -1403,30 +2575,6 @@ defmodule NxTest do
   end
 
   describe "sort/2" do
-    test "raises for unknown keys in options" do
-      t = Nx.tensor([3, 2, 1, 0])
-
-      assert_raise(
-        ArgumentError,
-        "unknown key :blep in [blep: :all_day], expected one of [:axis, :direction]",
-        fn ->
-          Nx.sort(t, blep: :all_day)
-        end
-      )
-    end
-
-    test "raises for non-keyword options" do
-      t = Nx.tensor([3, 2, 1, 0])
-
-      assert_raise(
-        ArgumentError,
-        "expected a keyword list with keys [:axis, :direction], got: [:blep]",
-        fn ->
-          Nx.sort(t, [:blep])
-        end
-      )
-    end
-
     test "raises for invalid direction" do
       t = Nx.tensor([3, 2, 1, 0])
 
@@ -1494,127 +2642,245 @@ defmodule NxTest do
     end
   end
 
-  describe "random_normal/3" do
-    test "works with shape input" do
-      t = Nx.random_normal({3, 3}, 0.1, 10.0)
-      assert Nx.shape(t) == {3, 3}
-      assert Nx.type(t) == {:f, 32}
+  describe "take" do
+    test "accepts scalar and number as index" do
+      assert Nx.take(Nx.iota({4}), 2) == Nx.tensor(2)
+      assert Nx.take(Nx.iota({4}), Nx.tensor(2)) == Nx.tensor(2)
+      assert Nx.take(Nx.iota({4}), Nx.tensor([0, 2])) == Nx.tensor([0, 2])
+    end
+  end
+
+  describe "take_diagonal/2" do
+    test "extracts valid diagonal given no offset" do
+      diag =
+        {3, 3}
+        |> Nx.iota()
+        |> Nx.take_diagonal()
+
+      assert diag == Nx.tensor([0, 4, 8])
     end
 
-    test "works with tensor input" do
-      t1 = Nx.iota({2})
-      t2 = Nx.random_normal(t1, 0.1, 10.0)
-      assert Nx.shape(t2) == {2}
-      assert Nx.type(t1) == {:s, 64}
-      assert Nx.type(t2) == {:f, 32}
-      assert t1 != t2
+    test "extracts valid diagonal when breadth is greater than length" do
+      diag =
+        {3, 4}
+        |> Nx.iota()
+        |> Nx.take_diagonal()
+
+      assert diag == Nx.tensor([0, 5, 10])
     end
 
-    test "works with tensor mu/sigma" do
-      t = Nx.random_normal({3, 3}, Nx.tensor(1.0), Nx.tensor(1.0))
-      assert Nx.shape(t) == {3, 3}
-      assert Nx.type(t) == {:f, 32}
+    test "extracts valid diagonal when length is greater than breadth" do
+      diag =
+        {4, 3}
+        |> Nx.iota()
+        |> Nx.take_diagonal()
+
+      assert diag == Nx.tensor([0, 4, 8])
     end
 
-    test "raises with non-float type" do
-      assert_raise(ArgumentError, "random_normal/3 expects float type, got: {:s, 32}", fn ->
-        Nx.random_normal(1, 0.1, 10.0, type: {:s, 32})
-      end)
+    test "extracts valid diagonal given positive offset" do
+      diag =
+        {3, 3}
+        |> Nx.iota()
+        |> Nx.take_diagonal(offset: 1)
+
+      assert diag == Nx.tensor([1, 5])
     end
 
-    test "raises with non-float sigma/mu" do
+    test "extracts valid diagonal given negative offset" do
+      diag =
+        {3, 3}
+        |> Nx.iota()
+        |> Nx.take_diagonal(offset: -1)
+
+      assert diag == Nx.tensor([3, 7])
+    end
+
+    test "extracts valid diagonal given batched matrices" do
+      diag =
+        {2, 3, 3}
+        |> Nx.iota()
+        |> Nx.take_diagonal()
+
+      assert diag == Nx.tensor([[0, 4, 8], [9, 13, 17]])
+    end
+
+    test "raises error given tensor with invalid rank" do
+      t = Nx.iota({3})
+
       assert_raise(
         ArgumentError,
-        "random_normal/3 expects mu and sigma to be float types, got: mu type: {:s, 64} and sigma type: {:s, 64}",
-        fn ->
-          Nx.random_normal({}, Nx.tensor(1), Nx.tensor(0))
-        end
+        "take_diagonal/2 expects tensor of rank 2 or higher, got tensor of rank: 1",
+        fn -> Nx.take_diagonal(t) end
       )
     end
 
-    test "raises with non-scalar shapes" do
+    test "raises error given invalid positive offset" do
+      t = Nx.iota({3, 3})
+
       assert_raise(
         ArgumentError,
-        "random_normal/3 expects mu and sigma to be scalars got: mu shape: {2} and sigma shape: {2}",
-        fn ->
-          Nx.random_normal({}, Nx.tensor([1.0, 2.0]), Nx.tensor([1.0, 2.0]))
-        end
+        "offset must be less than length of axis 1 when positive, got: 4",
+        fn -> Nx.take_diagonal(t, offset: 4) end
+      )
+    end
+
+    test "raisese error given invalid negative offset" do
+      t = Nx.iota({3, 3})
+
+      assert_raise(
+        ArgumentError,
+        "absolute value of offset must be less than length of axis 0 when negative, got: -3",
+        fn -> Nx.take_diagonal(t, offset: -3) end
       )
     end
   end
 
-  describe "random_uniform/3" do
-    test "works with shape input" do
-      t = Nx.random_uniform({3, 3}, 0.1, 10.0)
-      assert Nx.shape(t) == {3, 3}
-      assert Nx.type(t) == {:f, 32}
+  describe "make_diagonal/2" do
+    test "constructs valid diagonal given no offset" do
+      diag =
+        [1, 2, 3]
+        |> Nx.tensor()
+        |> Nx.make_diagonal()
+
+      assert diag == Nx.tensor([[1, 0, 0], [0, 2, 0], [0, 0, 3]])
     end
 
-    test "works with tensor input" do
-      t1 = Nx.iota({2})
-      t2 = Nx.random_uniform(t1, 0.1, 10.0)
-      assert Nx.shape(t2) == {2}
-      assert Nx.type(t1) == {:s, 64}
-      assert Nx.type(t2) == {:f, 32}
-      assert t1 != t2
+    test "constructs valid diagonal given positive offset" do
+      diag =
+        [1, 2, 3]
+        |> Nx.tensor()
+        |> Nx.make_diagonal(offset: 1)
+
+      assert diag == Nx.tensor([[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]])
     end
 
-    test "works with tensor min/max" do
-      t = Nx.random_uniform({2}, Nx.tensor(-1.0), Nx.tensor(5.0))
-      assert Nx.shape(t) == {2}
-      assert Nx.type(t) == {:f, 32}
+    test "constructs valid diagonal given negative offset" do
+      diag =
+        [1, 2, 3]
+        |> Nx.tensor()
+        |> Nx.make_diagonal(offset: -1)
+
+      assert diag == Nx.tensor([[0, 0, 0, 0], [1, 0, 0, 0], [0, 2, 0, 0], [0, 0, 3, 0]])
     end
 
-    test "works with compatible types" do
-      t = Nx.random_uniform(1, 0, 10, type: {:s, 32})
-      assert Nx.shape(t) == {}
-      assert Nx.type(t) == {:s, 32}
-    end
+    test "raises error given tensor with invalid rank" do
+      t = Nx.iota({3, 3, 3})
 
-    test "raises for incompatible types" do
       assert_raise(
         ArgumentError,
-        "random_uniform/3 expects compatible types, got: {:s, 32} with range {:f, 32}",
-        fn ->
-          Nx.random_uniform(1, 0.1, 10.0, type: {:s, 32})
-        end
-      )
-    end
-
-    test "raises for incompatible shapes" do
-      assert_raise(
-        ArgumentError,
-        "random_uniform/3 expects min and max to be scalars, got: min shape: {3} and max shape: {3}",
-        fn ->
-          Nx.random_uniform(1, Nx.tensor([1.0, 2.0, 3.0]), Nx.tensor([1.0, 2.0, 3.0]))
-        end
+        "make_diagonal/2 expects tensor of rank 1, got tensor of rank: 3",
+        fn -> Nx.make_diagonal(t) end
       )
     end
   end
 
-  describe "eye/2" do
-    test "raises for non-square rank 2 tensor" do
-      t = Nx.iota({2, 3})
+  describe "put_diagonal/2" do
+    test "puts valid diagonal given no offset" do
+      target = Nx.iota({3, 3})
 
-      assert_raise(ArgumentError, "eye/2 expects a square matrix, got: {2, 3}", fn ->
-        Nx.eye(t)
-      end)
+      diag =
+        [1, 2, 3]
+        |> Nx.tensor()
+        |> then(&Nx.put_diagonal(target, &1))
+
+      assert diag == Nx.tensor([[1, 1, 2], [3, 2, 5], [6, 7, 3]])
     end
 
-    test "raises for tensor that is not rank 2" do
-      t = Nx.iota({2, 3, 2})
+    test "puts valid diagonal given positive offset" do
+      target = Nx.broadcast(0, {4, 4})
 
-      assert_raise(ArgumentError, "eye/2 expects a square matrix, got: {2, 3, 2}", fn ->
-        Nx.eye(t)
-      end)
+      diag =
+        [1, 2, 3]
+        |> Nx.tensor()
+        |> then(&Nx.put_diagonal(target, &1, offset: 1))
+
+      assert diag == Nx.tensor([[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]])
+    end
+
+    test "puts valid diagonal given negative offset" do
+      target = Nx.broadcast(0, {4, 4})
+
+      diag =
+        [1, 2, 3]
+        |> Nx.tensor()
+        |> then(&Nx.put_diagonal(target, &1, offset: -1))
+
+      assert diag == Nx.tensor([[0, 0, 0, 0], [1, 0, 0, 0], [0, 2, 0, 0], [0, 0, 3, 0]])
+    end
+
+    test "raises error given tensor with invalid rank" do
+      t = Nx.iota({3, 3, 3})
+      u = Nx.iota({3})
+
+      assert_raise(
+        ArgumentError,
+        "put_diagonal/3 expects tensor of rank 2, got tensor of rank: 3",
+        fn -> Nx.put_diagonal(t, u) end
+      )
+    end
+
+    test "raises error given diagonal with invalid rank" do
+      t = Nx.iota({3, 3})
+      u = Nx.iota({3, 3})
+
+      assert_raise(
+        ArgumentError,
+        "put_diagonal/3 expects diagonal of rank 1, got tensor of rank: 2",
+        fn -> Nx.put_diagonal(t, u) end
+      )
+    end
+
+    test "raises error given diagonal tensor with invalid length, given no offset" do
+      t = Nx.iota({3, 3})
+      u = Nx.iota({2})
+
+      assert_raise(
+        ArgumentError,
+        "expected diagonal tensor of length: 3, got diagonal tensor of length: 2",
+        fn -> Nx.put_diagonal(t, u) end
+      )
+    end
+
+    test "raises error given diagonal tensor with invalid length, given a valid offset" do
+      t = Nx.iota({3, 3})
+      u = Nx.iota({3})
+
+      assert_raise(
+        ArgumentError,
+        "expected diagonal tensor of length: 2, got diagonal tensor of length: 3",
+        fn -> Nx.put_diagonal(t, u, offset: 1) end
+      )
+    end
+
+    test "raises error given an invalid positive offset" do
+      t = Nx.iota({3, 3})
+      u = Nx.iota({3})
+
+      assert_raise(
+        ArgumentError,
+        "offset must be less than length of axis 1 when positive, got: 4",
+        fn -> Nx.put_diagonal(t, u, offset: 4) end
+      )
+    end
+
+    test "raises error given an invalid negative offset" do
+      t = Nx.iota({3, 3})
+      u = Nx.iota({3})
+
+      assert_raise(
+        ArgumentError,
+        "absolute value of offset must be less than length of axis 0 when negative, got: -3",
+        fn -> Nx.put_diagonal(t, u, offset: -3) end
+      )
     end
   end
 
-  describe "scatter_add/3" do
+  describe "indexed_add/3" do
     test "can emulate take_along_axis" do
       # One can also convert the indices produced by argsort into suitable
-      # indices for scatter-add as below.
-      # The following example emulates `take_along_axis/3` with `scatter_add/3`
+      # indices for indexed_add as below.
+      # The following example emulates `take_along_axis/3` with `indexed_add/3`
 
       t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
       axis = 1
@@ -1630,7 +2896,7 @@ defmodule NxTest do
 
       iotas =
         Enum.map(0..(Nx.rank(t) - 1)//1, fn axis ->
-          t |> Nx.iota(axis: axis) |> Nx.reshape({num_elements, 1})
+          t |> Nx.shape() |> Nx.iota(axis: axis) |> Nx.reshape({num_elements, 1})
         end)
 
       iotas = List.replace_at(iotas, axis, Nx.reshape(i, {num_elements, 1}))
@@ -1638,11 +2904,115 @@ defmodule NxTest do
       indices = Nx.concatenate(iotas, axis: 1)
 
       assert Nx.tensor([[5, 4], [3, 2], [1, 0]]) ==
-               Nx.scatter_add(
+               Nx.indexed_add(
                  Nx.broadcast(0, Nx.shape(t)),
                  indices,
                  Nx.reshape(t, {num_elements})
                )
+    end
+
+    test "works with all integer types in indices" do
+      for kind <- [:u, :s], width <- [2, 4, 8, 16, 32, 64] do
+        indices = Nx.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], type: {kind, width})
+
+        assert Nx.add(Nx.iota({2, 2}), 1) ==
+                 Nx.indexed_add(Nx.broadcast(0, {2, 2}), indices, Nx.tensor([1, 2, 3, 4]))
+      end
+    end
+
+    test "fails for all non-integer types in indices" do
+      for type <- [f: 16, bf: 16, f: 32, f: 64, c: 64, c: 128] do
+        indices = Nx.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], type: type)
+
+        assert_raise ArgumentError,
+                     "indices must be an integer tensor, got type: #{inspect(type)}",
+                     fn ->
+                       Nx.indexed_add(Nx.broadcast(0, {2, 2}), indices, Nx.tensor([1, 2, 3, 4]))
+                     end
+      end
+    end
+  end
+
+  describe "serialize/deserialize" do
+    test "v1 regression" do
+      serialized = [
+        <<131, 104, 3, 97, 1, 100, 0, 6, 108, 105, 116, 116, 108, 101, 104, 3, 100, 0, 29, 69,
+          108, 105, 120, 105, 114, 46, 78, 120, 46, 67, 111, 110, 116, 97, 105, 110, 101, 114, 46,
+          67, 111, 110, 116, 97, 105, 110, 101, 114, 108, 0, 0, 0, 2, 104, 2, 100, 0, 1, 97, 104,
+          3, 100, 0, 25, 69, 108, 105, 120, 105, 114, 46, 78, 120, 46, 67, 111, 110, 116, 97, 105,
+          110, 101, 114, 46, 84, 117, 112, 108, 101, 108, 0, 0, 0, 2, 104, 2, 106, 104, 5, 100, 0,
+          6, 116, 101, 110, 115, 111, 114, 104, 0, 104, 2, 100, 0, 1, 115, 97, 64, 106, 109, 0, 0,
+          0, 8, 1, 0, 0, 0, 0, 0, 0, 0, 104, 2, 106, 104, 5, 100, 0, 6, 116, 101, 110, 115, 111,
+          114, 104, 0, 104, 2, 100, 0, 1, 115, 97, 64, 106, 109, 0, 0, 0, 8, 2, 0, 0, 0, 0, 0, 0,
+          0, 106, 100, 0, 2, 111, 107, 104, 2, 100, 0, 1, 98, 104, 3, 100, 0, 23, 69, 108, 105,
+          120, 105, 114, 46, 78, 120, 46, 67, 111, 110, 116, 97, 105, 110, 101, 114, 46, 77, 97,
+          112, 108, 0, 0, 0, 1, 104, 2, 100, 0, 3, 107, 101, 121, 104, 5, 100, 0, 6, 116, 101,
+          110, 115, 111, 114, 104, 0, 104, 2, 100, 0, 1, 115, 97, 64, 106, 109, 0, 0, 0, 8, 3, 0,
+          0, 0, 0, 0, 0, 0, 106, 100, 0, 2, 111, 107, 106, 108, 0, 0, 0, 1, 104, 2, 100, 0, 1,
+          100, 100, 0, 4, 107, 101, 112, 116, 106>>
+      ]
+
+      assert {1, :little, _} =
+               serialized |> :erlang.iolist_to_binary() |> :erlang.binary_to_term()
+
+      assert Nx.deserialize(serialized) == %Container{
+               a: {Nx.tensor(1, type: :s64), Nx.tensor(2, type: :s64)},
+               b: %{key: Nx.tensor(3, type: :s64)},
+               c: %{},
+               d: :kept
+             }
+    end
+
+    test "containers" do
+      container = %Container{
+        a: {Nx.tensor(1), Nx.tensor(2)},
+        b: %{key: Nx.tensor(3)},
+        c: :discarded,
+        d: :kept
+      }
+
+      assert Nx.deserialize(Nx.serialize(container)) == %{container | c: %{}}
+    end
+
+    test "numbers" do
+      assert Nx.deserialize(Nx.serialize(123)) == Nx.tensor(123)
+      assert Nx.deserialize(Nx.serialize(1.2)) == Nx.tensor(1.2)
+    end
+
+    test "vectorized" do
+      tensor = Nx.tensor([[1], [2], [3]]) |> Nx.vectorize(:x)
+      assert Nx.deserialize(Nx.serialize(tensor)) == tensor
+    end
+  end
+
+  describe "load_numpy/1" do
+    test "loads array" do
+      assert Nx.load_numpy!(File.read!("test/fixtures/numpy/no_dims_int64.npy")) ==
+               Nx.tensor(123, type: {:s, 64})
+
+      assert Nx.load_numpy!(File.read!("test/fixtures/numpy/1d_int64.npy")) ==
+               Nx.tensor([1, 2, 3, 4], type: {:s, 64})
+
+      assert Nx.load_numpy!(File.read!("test/fixtures/numpy/2d_float32.npy")) ==
+               Nx.tensor([[1, 2], [3, 4], [5, 6]], type: {:f, 32})
+
+      assert Nx.load_numpy!(File.read!("test/fixtures/numpy/1d_uint8.npy")) ==
+               Nx.tensor([1, 2, 3], type: {:u, 8})
+    end
+  end
+
+  describe "load_numpy_archive!/1" do
+    test "loads archive" do
+      expected = [
+        {"foo", Nx.tensor([1, 2, 3], type: {:s, 64})},
+        {"bar", Nx.tensor([-1, 1], type: {:f, 32})},
+        {"a_longer_name", Nx.tensor([123], type: {:s, 64})}
+      ]
+
+      assert Nx.load_numpy_archive!(File.read!("test/fixtures/numpy/archive.npz")) == expected
+
+      assert Nx.load_numpy_archive!(File.read!("test/fixtures/numpy/archive_compressed.npz")) ==
+               expected
     end
   end
 
@@ -1650,15 +3020,17 @@ defmodule NxTest do
     test "evaluates to tensor" do
       import Nx
 
-      assert ~M[-1 2 3 4] == Nx.tensor([[-1, 2, 3, 4]])
-      assert ~M[1
+      assert ~MAT[-1 2 3 4] == Nx.tensor([[-1, 2, 3, 4]])
+
+      assert ~MAT[1
                 2
                 3
                 4] == Nx.tensor([[1], [2], [3], [4]])
-      assert ~M[1.0 2  3
+
+      assert ~MAT[1.0 2  3
                 11  12 13] == Nx.tensor([[1.0, 2, 3], [11, 12, 13]])
 
-      assert ~V[4 3 2 1] == Nx.tensor([4, 3, 2, 1])
+      assert ~VEC[4 3 2 1] == Nx.tensor([4, 3, 2, 1])
     end
 
     test "raises when vector has more than one dimension" do
@@ -1666,45 +3038,852 @@ defmodule NxTest do
         ArgumentError,
         "must be one-dimensional",
         fn ->
-          eval(~S[~V<0 0 0 1
+          eval(~S[~VEC<0 0 0 1
                      1 0 0 0>])
         end
       )
     end
 
-    if Version.match?(System.version(), ">= 1.13.0-dev") do
-      test "evaluates with proper type" do
-        assert eval("~M[1 2 3 4]f32") == Nx.tensor([[1, 2, 3, 4]], type: {:f, 32})
-        assert eval("~M[4 3 2 1]u8") == Nx.tensor([[4, 3, 2, 1]], type: {:u, 8})
+    test "evaluates with proper type" do
+      assert eval("~MAT[1 2 3 4]f32") == Nx.tensor([[1, 2, 3, 4]], type: {:f, 32})
+      assert eval("~MAT[4 3 2 1]u8") == Nx.tensor([[4, 3, 2, 1]], type: {:u, 8})
 
-        assert eval("~V[0 1 0 1]u8") == Nx.tensor([0, 1, 0, 1], type: {:u, 8})
+      assert eval("~VEC[0 1 0 1]u8") == Nx.tensor([0, 1, 0, 1], type: {:u, 8})
+    end
+
+    test "raises on invalid type" do
+      assert_raise(
+        ArgumentError,
+        "invalid numerical type: {:f, 4} (see Nx.Type docs for all supported types)",
+        fn ->
+          eval("~MAT[1 2 3 4]f4")
+        end
+      )
+    end
+
+    test "raises on non-numerical values" do
+      assert_raise(
+        ArgumentError,
+        "expected a numerical value for tensor, got x",
+        fn ->
+          eval("~VEC[1 2 x 4]u8")
+        end
+      )
+    end
+
+    defp eval(expression) do
+      "import Nx; #{expression}"
+      |> Code.eval_string()
+      |> elem(0)
+    end
+  end
+
+  describe "gather" do
+    test "raises when out of bounds" do
+      t = Nx.tensor([[1, 2], [3, 4]])
+
+      assert_raise ArgumentError, "index 3 is out of bounds for axis 0 in shape {2, 2}", fn ->
+        Nx.gather(t, Nx.tensor([[3, -10]]))
       end
 
-      test "raises on invalid type" do
-        assert_raise(
-          ArgumentError,
-          "invalid numerical type: {:f, 8} (see Nx.Type docs for all supported types)",
-          fn ->
-            eval("~M[1 2 3 4]f8")
-          end
-        )
+      assert_raise ArgumentError, "index -1 is out of bounds for axis 1 in shape {2, 2}", fn ->
+        Nx.gather(t, Nx.tensor([[0, -1]]))
+      end
+    end
+
+    test "raises correct error on scalar indices" do
+      assert_raise ArgumentError, ~r/expected indices rank to be at least 1/, fn ->
+        Nx.gather(Nx.iota({3}), Nx.tensor(0))
+      end
+    end
+  end
+
+  describe "variance/1" do
+    test "calculates variance of a tensor" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      assert Nx.variance(t) == Nx.tensor(2.9166667461395264)
+    end
+
+    test "uses optional ddof" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      assert Nx.variance(t, ddof: 1) == Nx.tensor(3.5)
+    end
+
+    test "uses optional axes" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]], names: [:x, :y])
+
+      assert Nx.variance(t, axes: [:x]) ==
+               Nx.tensor([1.5555557012557983, 4.222222328186035], names: [:y])
+
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]], names: [:x, :y])
+      assert Nx.variance(t, axes: [:y]) == Nx.tensor([0.25, 0.25, 0.25], names: [:x])
+    end
+
+    test "uses optional keep axes" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      assert Nx.variance(t, keep_axes: true) == Nx.tensor([[2.9166667461395264]])
+    end
+  end
+
+  describe "standard_deviation/1" do
+    test "calculates the standard deviation of a tensor" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      assert Nx.standard_deviation(t) == Nx.tensor(1.707825127659933)
+    end
+
+    test "uses optional ddof" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      assert Nx.standard_deviation(t, ddof: 1) == Nx.tensor(1.8708287477493286)
+    end
+
+    test "uses optional axes" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+
+      assert Nx.standard_deviation(t, axes: [0]) ==
+               Nx.tensor([1.247219204902649, 2.054804801940918])
+    end
+
+    test "uses optional keep axes" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      assert Nx.standard_deviation(t, keep_axes: true) == Nx.tensor([[1.7078251838684082]])
+    end
+  end
+
+  describe "covariance/1" do
+    test "calculates the covariance of a tensor" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+
+      assert Nx.covariance(t) ==
+               Nx.tensor([
+                 [1.5555554628372192, 2.444444417953491],
+                 [2.444444417953491, 4.222222328186035]
+               ])
+    end
+
+    test "with tensor batch" do
+      t = Nx.tensor([[[4, 5], [2, 3], [1, 0]], [[10, 11], [8, 9], [7, 6]]])
+
+      assert Nx.covariance(t) ==
+               Nx.tensor([
+                 [
+                   [1.5555554628372192, 2.444444417953491],
+                   [2.444444417953491, 4.222222328186035]
+                 ],
+                 [
+                   [1.5555554628372192, 2.444444417953491],
+                   [2.444444417953491, 4.222222328186035]
+                 ]
+               ])
+    end
+
+    test "with mean" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      mean = Nx.tensor([3, 2])
+
+      assert Nx.covariance(t, mean) ==
+               Nx.tensor([
+                 [2.0, 2.0],
+                 [2.0, 4.666666507720947]
+               ])
+    end
+
+    test "with mean batch" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+      mean = Nx.tensor([[3, 2], [2, 3]])
+
+      assert Nx.covariance(t, mean) ==
+               Nx.tensor([
+                 [
+                   [2.0, 2.0],
+                   [2.0, 4.666666507720947]
+                 ],
+                 [
+                   [1.6666666269302368, 2.3333332538604736],
+                   [2.3333332538604736, 4.333333492279053]
+                 ]
+               ])
+    end
+
+    test "uses optional ddof" do
+      t = Nx.tensor([[4, 5], [2, 3], [1, 0]])
+
+      assert Nx.covariance(t, ddof: 1) ==
+               Nx.tensor([
+                 [2.3333332538604736, 3.6666667461395264],
+                 [3.6666667461395264, 6.333333492279053]
+               ])
+    end
+  end
+
+  describe "weighted_mean/3" do
+    test "shape of input differs from shape of weights" do
+      t = Nx.iota({4, 6})
+      weights = Nx.tensor([1, 2, 3, 4])
+
+      assert Nx.weighted_mean(t, weights, axes: [0]) ==
+               Nx.tensor([12.0, 13.0, 14.0, 15.0, 16.0, 17.0])
+    end
+  end
+
+  describe "median/2" do
+    test "uses optional keep axis with unsorted tensor" do
+      t = Nx.tensor([[[4, 5, 8], [1, 6, 7]], [[3, 9, 2], [7, 5, 6]]])
+
+      assert Nx.median(t, axis: -1, keep_axis: true) ==
+               Nx.tensor([[[5], [6]], [[3], [6]]])
+    end
+  end
+
+  describe "complex/2" do
+    @t32 Nx.tensor(1, type: :f32)
+    @t64 Nx.tensor(2, type: :f64)
+
+    test "preserves precision of real and imaginary parts" do
+      t = Nx.tensor(Complex.new(1, 2), type: :c128)
+      c = Nx.complex(Nx.real(t), Nx.imag(t))
+      assert Nx.type(c) == {:c, 128}
+
+      t = Nx.tensor(Complex.new(1, 3), type: :c64)
+      c = Nx.complex(Nx.real(t), Nx.imag(t))
+      assert Nx.type(c) == {:c, 64}
+    end
+
+    test "returns a tensor with type :c128 for 64 bit inputs" do
+      t = Nx.complex(@t64, @t64)
+      assert Nx.type(t) == {:c, 128}
+    end
+
+    test "returns a tensor with type :c128 for mixed 32 and 64 bit inputs" do
+      t = Nx.complex(@t32, @t64)
+      assert Nx.type(t) == {:c, 128}
+
+      t = Nx.complex(@t64, @t32)
+      assert Nx.type(t) == {:c, 128}
+    end
+  end
+
+  describe "as_type/2" do
+    test "preserves the imaginary part when casting between :c68 and :c128" do
+      t64 = Nx.tensor(Complex.new(1, 2), type: :c64)
+      t128 = Nx.tensor(Complex.new(1, 2), type: :c128)
+
+      assert Nx.as_type(t128, :c64) == t64
+      assert Nx.as_type(t64, :c128) == t128
+    end
+
+    test "keeps only real part when downcasting complex to real" do
+      z = Complex.new(1, 2)
+      t64 = Nx.tensor(z, type: :c64)
+
+      for type <- [f: 32, f: 64] do
+        assert Nx.as_type(t64, type) == Nx.tensor(z.re, type: type)
       end
 
-      test "raises on non-numerical values" do
-        assert_raise(
-          ArgumentError,
-          "expected a numerical value for tensor, got x",
-          fn ->
-            eval("~V[1 2 x 4]u8")
-          end
+      for type <- [s: 64, s: 32, s: 16, s: 8, u: 64, u: 32, u: 16, u: 8] do
+        assert Nx.as_type(t64, type) == Nx.tensor(trunc(z.re), type: type)
+      end
+    end
+  end
+
+  describe "with_default_backend/2" do
+    test "implicitly uses the given backend inside the given function" do
+      left =
+        Nx.with_default_backend(Nx.Defn.Expr, fn ->
+          Nx.iota({4}) |> Nx.sin()
+        end)
+
+      right = Nx.iota({4}, backend: Nx.Defn.Expr) |> Nx.sin()
+
+      assert inspect(left) == inspect(right)
+    end
+  end
+
+  describe "linspace/3" do
+    test "works for :f64 (bug fix: https://github.com/elixir-nx/nx/issues/1222)" do
+      linear = Nx.linspace(0.0, 0.5, n: 6, type: :f64)
+      expected_linear = Nx.tensor([0.0, 0.1, 0.2, 0.3, 0.4, 0.5], type: :f64)
+      assert_all_close(linear, expected_linear, atol: 1.0e-15, rtol: 1.0e-15)
+    end
+
+    test "n=1 returns start value" do
+      assert Nx.linspace(0, 10, n: 1) == Nx.tensor([0.0])
+    end
+
+    test "n=1 with same start/stop" do
+      assert Nx.linspace(5, 5, n: 1) == Nx.tensor([5.0])
+    end
+  end
+
+  describe "reflect/2" do
+    test "reflects over axes of size 1" do
+      assert Nx.tensor([1, 1, 1, 1]) == Nx.pad_outer(Nx.tensor([1]), :reflect, [{2, 1}])
+
+      assert Nx.tensor([[[1, 1, 1, 1]]]) ==
+               Nx.pad_outer(Nx.tensor([[[1]]]), :reflect, [{0, 0}, {0, 0}, {2, 1}])
+    end
+
+    test "semantic error on invalid padding config" do
+      assert_raise ArgumentError,
+                   "expected padding config for axis 0 to be of the format {left, right}, with left and right as non-negative integers, got: {0}",
+                   fn ->
+                     Nx.pad_outer(Nx.tensor([0]), :reflect, [{0}])
+                   end
+
+      assert_raise ArgumentError,
+                   "expected padding config for axis 2 to be of the format {left, right}, with left and right as non-negative integers, got: {-1, 0}",
+                   fn ->
+                     Nx.pad_outer(Nx.tensor([[[0]]]), :reflect, [{0, 0}, {0, 0}, {-1, 0}])
+                   end
+    end
+  end
+
+  describe "mode" do
+    test "axis" do
+      assert Nx.tensor([[1, 2, 3]]) |> Nx.mode(axis: 0) == Nx.tensor([1, 2, 3])
+      assert Nx.tensor([[1, 2, 3]]) |> Nx.mode(axis: 0, keep_axis: true) == Nx.tensor([[1, 2, 3]])
+      assert Nx.mode(Nx.tensor([[1], [2], [1], [3]]), axis: 1) == Nx.tensor([1, 2, 1, 3])
+    end
+
+    test "keep_axis" do
+      assert Nx.mode(Nx.tensor(1), keep_axis: true) == Nx.tensor([1])
+      assert Nx.mode(Nx.tensor([[[1]]]), keep_axis: true) == Nx.tensor([[[1]]])
+    end
+  end
+
+  describe "reshape_vectors" do
+    test "returns correct axes' order" do
+      x = Nx.iota({1}, vectorized_axes: [x: 1])
+      xy = Nx.iota({1}, vectorized_axes: [x: 1, y: 2])
+      x2 = Nx.iota({1}, vectorized_axes: [x: 2])
+
+      assert [
+               %{x | vectorized_axes: [x: 1, y: 1]},
+               %{xy | vectorized_axes: [x: 1, y: 2]},
+               %{x2 | vectorized_axes: [x: 2, y: 1]}
+             ] == Nx.reshape_vectors([x, xy, x2])
+    end
+  end
+
+  describe "broadcast_vectors" do
+    test "returns correct axes' order" do
+      x = Nx.iota({1}, vectorized_axes: [x: 1])
+      xy = Nx.iota({1, 2}, vectorized_axes: [x: 1, y: 2])
+      x2 = Nx.iota({1, 2, 3}, vectorized_axes: [x: 2])
+
+      result = [
+        Nx.iota({1}, vectorized_axes: [x: 2, y: 2]),
+        Nx.iota({1, 2}, vectorized_axes: [x: 2, y: 2]),
+        Nx.iota({1, 2, 3}, vectorized_axes: [x: 2, y: 2])
+      ]
+
+      assert result == Nx.broadcast_vectors([x, xy, x2])
+      assert result == Nx.broadcast_vectors([x, xy, x2], align_ranks: false)
+    end
+
+    test "returns correct axes' order and shape for align_ranks: true" do
+      x = Nx.iota({1}, vectorized_axes: [x: 1])
+      xy = Nx.iota({1, 2}, vectorized_axes: [x: 1, y: 2])
+      x2 = Nx.iota({1, 2, 3}, vectorized_axes: [x: 2])
+
+      assert [
+               Nx.iota({1, 1, 1}, vectorized_axes: [x: 2, y: 2]),
+               Nx.iota({1, 1, 2}, vectorized_axes: [x: 2, y: 2]),
+               Nx.iota({1, 2, 3}, vectorized_axes: [x: 2, y: 2])
+             ] == Nx.broadcast_vectors([x, xy, x2], align_ranks: true)
+    end
+  end
+
+  describe "vectorization" do
+    test "vectorizes and devectorizes containers" do
+      container = {Nx.tensor([1]), %{a: Nx.tensor([2]), b: {Nx.tensor([3]), Nx.tensor([[4, 5]])}}}
+
+      vectorized = Nx.vectorize(container, x: 1)
+
+      assert vectorized ==
+               {Nx.tensor([1]) |> Nx.vectorize(x: 1),
+                %{
+                  a: Nx.tensor([2]) |> Nx.vectorize(x: 1),
+                  b:
+                    {Nx.tensor([3]) |> Nx.vectorize(x: 1),
+                     Nx.tensor([[4, 5]]) |> Nx.vectorize(x: 1)}
+                }}
+
+      assert Nx.devectorize({1, vectorized}, keep_names: false) == {Nx.tensor(1), container}
+    end
+
+    test "broadcasts work for vectorized scalars vs non-vectorized operand" do
+      v = Nx.tensor([0, 1]) |> Nx.vectorize(x: 2)
+      t = Nx.iota({2, 3})
+
+      result =
+        Nx.tensor([
+          [
+            [0, 1, 2],
+            [3, 4, 5]
+          ],
+          [
+            [1, 2, 3],
+            [4, 5, 6]
+          ]
+        ])
+        |> Nx.vectorize(x: 2)
+
+      assert Nx.add(t, v) == result
+      assert Nx.add(v, t) == result
+    end
+
+    test "broadcasts work for vectorized 1D tensors vs non-vectorized operand" do
+      v = Nx.tensor([[0, 1, 2], [10, 20, 30]]) |> Nx.vectorize(x: 2)
+      t = Nx.iota({2, 3})
+
+      result =
+        Nx.tensor([
+          [
+            [0, 2, 4],
+            [3, 5, 7]
+          ],
+          [
+            [10, 21, 32],
+            [13, 24, 35]
+          ]
+        ])
+        |> Nx.vectorize(x: 2)
+
+      assert Nx.add(t, v) == result
+      assert Nx.add(v, t) == result
+    end
+
+    test "broadcasts work for vectorized scalars vs vectorized operand" do
+      v = Nx.tensor([0, 1]) |> Nx.vectorize(x: 2)
+      t = Nx.iota({2, 3}, vectorized_axes: [x: 1, y: 2])
+
+      result =
+        Nx.tensor([
+          [
+            [
+              [0, 1, 2],
+              [3, 4, 5]
+            ],
+            [
+              [0, 1, 2],
+              [3, 4, 5]
+            ]
+          ],
+          [
+            [
+              [1, 2, 3],
+              [4, 5, 6]
+            ],
+            [
+              [1, 2, 3],
+              [4, 5, 6]
+            ]
+          ]
+        ])
+        |> Nx.vectorize(x: 2, y: 2)
+
+      assert Nx.add(t, v) == result
+      assert Nx.add(v, t) == result
+    end
+
+    test "broadcasts work for vectorized 1D tensors vs vectorized operand" do
+      v = Nx.tensor([[0, 1, 2], [10, 20, 30]]) |> Nx.vectorize(x: 2)
+      t = Nx.iota({2, 3}, vectorized_axes: [x: 1, y: 2])
+
+      result =
+        Nx.tensor([
+          [
+            [
+              [0, 2, 4],
+              [3, 5, 7]
+            ],
+            [
+              [0, 2, 4],
+              [3, 5, 7]
+            ]
+          ],
+          [
+            [
+              [10, 21, 32],
+              [13, 24, 35]
+            ],
+            [
+              [10, 21, 32],
+              [13, 24, 35]
+            ]
+          ]
+        ])
+        |> Nx.vectorize(x: 2, y: 2)
+
+      assert Nx.add(t, v) == result
+      assert Nx.add(v, t) == result
+    end
+  end
+
+  describe "select" do
+    # pred is smaller than the output, and on_false is smaller than, larger than or equal to
+    # on_true.
+    test "broadcasts a smaller pred, vectorized or not" do
+      pred = Nx.tensor([[1], [0]], type: :u8)
+      vectorized_pred = Nx.tensor([[[1], [0]], [[0], [1]]], type: :u8) |> Nx.vectorize(:x)
+
+      for {on_true, on_false, expected, expected_vectorized} <- [
+            {[[10, 20, 30], [40, 50, 60]], [1, 2, 3], [[10, 20, 30], [1, 2, 3]],
+             [[[10, 20, 30], [1, 2, 3]], [[1, 2, 3], [40, 50, 60]]]},
+            {[10, 20, 30], [[1, 2, 3], [4, 5, 6]], [[10, 20, 30], [4, 5, 6]],
+             [[[10, 20, 30], [4, 5, 6]], [[1, 2, 3], [10, 20, 30]]]},
+            {[[10, 20, 30], [40, 50, 60]], [[1, 2, 3], [4, 5, 6]], [[10, 20, 30], [4, 5, 6]],
+             [[[10, 20, 30], [4, 5, 6]], [[1, 2, 3], [40, 50, 60]]]}
+          ] do
+        on_true = Nx.tensor(on_true)
+        on_false = Nx.tensor(on_false)
+
+        assert_equal(Nx.select(pred, on_true, on_false), Nx.tensor(expected))
+
+        assert_equal(
+          Nx.select(vectorized_pred, on_true, on_false),
+          expected_vectorized |> Nx.tensor() |> Nx.vectorize(:x)
         )
       end
     end
 
-    defp eval(expresion) do
-      "import Nx; #{expresion}"
-      |> Code.eval_string()
-      |> elem(0)
+    test "takes the names from a non-scalar pred" do
+      pred = Nx.tensor([1, 0, 1], type: :u8, names: [:y])
+      assert Nx.select(pred, Nx.iota({2, 3}, names: [:x, :z]), 0).names == [nil, :y]
+    end
+
+    test "works with vectorized scalar pred" do
+      pred = Nx.tensor([0, 1]) |> Nx.vectorize(x: 2)
+      on_true = Nx.tensor([[0, 1, 2]])
+      on_false = Nx.tensor([[3, 4, 5]])
+
+      assert Nx.select(pred, on_true, on_false) ==
+               Nx.tensor([[[3, 4, 5]], [[0, 1, 2]]]) |> Nx.vectorize(x: 2)
+
+      pred = Nx.tensor([0, 1]) |> Nx.vectorize(x: 2)
+      on_true = Nx.tensor([[0, 1, 2]]) |> Nx.vectorize(x: 1)
+      on_false = Nx.tensor([[3, 4, 5]]) |> Nx.vectorize(x: 1)
+
+      assert Nx.select(pred, on_true, on_false) ==
+               Nx.tensor([[3, 4, 5], [0, 1, 2]]) |> Nx.vectorize(x: 2)
+    end
+
+    test "works with scalar pred and vectorized inputs" do
+      assert Nx.select(
+               1,
+               Nx.iota({2}, vectorized_axes: [x: 2]),
+               Nx.tensor([[3, 4]]) |> Nx.vectorize(x: 1)
+             ) == Nx.tensor([[0, 1], [0, 1]]) |> Nx.vectorize(x: 2)
+    end
+  end
+
+  describe "fft/ifft" do
+    test "Bluestein clause" do
+      # we need a tensor which isn't a power of 2 and is > than 1024 to actually
+      # validate the bluestein implementation. No doctests check for it.
+      x = Nx.tile(~VEC[1 1 1 0 0 0], [400])
+      x_fft = Nx.fft(x)
+
+      # From numpy we expect the following indices to be the only non-zero values in the tensor
+      non_zero_idx = Nx.tensor([0, 400, 1200, 2000])
+      assert Nx.take(x_fft, non_zero_idx) == ~VEC[1200 400-692.820323i 400 400+692.820323i]
+
+      zeros_check = Nx.indexed_put(x_fft, Nx.new_axis(non_zero_idx, 1), ~VEC[0 0 0 0])
+      zeros = Nx.broadcast(0, x_fft)
+      assert_all_close(Nx.real(zeros_check), zeros, atol: 1.0e-9)
+      assert_all_close(Nx.imag(zeros_check), zeros, atol: 1.0e-9)
+
+      # Because we implement ifft in terms of fft, we'll use the same tensor as validation
+      x_ifft = Nx.ifft(x_fft)
+      assert_all_close(x, Nx.real(x_ifft), atol: 1.0e-8)
+      assert_all_close(zeros, Nx.imag(x_ifft), atol: 1.0e-8)
+    end
+  end
+
+  describe "split/2" do
+    test "split is less than zero" do
+      tensor = Nx.iota({10, 3}, names: [:x, :y])
+
+      assert Nx.split(tensor, -1, axis: 1) == {tensor[[.., 0..1]], tensor[[.., 2..2]]}
+    end
+
+    test "split with negative float" do
+      tensor = Nx.iota({10, 2}, names: [:x, :y])
+
+      assert_raise ArgumentError,
+                   "split must be a float such that 0 < split and ceil(split * axis_size) < 1",
+                   fn ->
+                     Nx.split(tensor, -0.5)
+                   end
+    end
+
+    test "split is a float out of bounds" do
+      tensor = Nx.iota({10, 2}, names: [:x, :y])
+
+      assert_raise ArgumentError,
+                   "split must be a float such that 0 < split and ceil(split * axis_size) < 1",
+                   fn ->
+                     Nx.split(tensor, 1.0)
+                   end
+    end
+
+    test "split is greater than tensor length" do
+      tensor = Nx.iota({10, 2}, names: [:x, :y])
+
+      assert_raise ArgumentError,
+                   "split must be an integer greater than zero and less than the length of the given axis",
+                   fn ->
+                     Nx.split(tensor, 3, axis: 1)
+                   end
+    end
+
+    test "axis is out of tensor bounds" do
+      tensor = Nx.iota({10, 2}, names: [:x, :y])
+
+      assert_raise ArgumentError,
+                   "given axis (2) invalid for shape with rank 2",
+                   fn ->
+                     Nx.split(tensor, 2, axis: 2)
+                   end
+    end
+
+    test "named axis is invalid" do
+      tensor = Nx.iota({10, 2}, names: [:x, :y])
+
+      assert_raise ArgumentError,
+                   "name :z not found in tensor with names [:x, :y]",
+                   fn ->
+                     Nx.split(tensor, 2, axis: :z)
+                   end
+    end
+
+    test "split into 50% for training and 50% for testing with floats on columns" do
+      tensor = Nx.iota({4, 4}, names: [:rows, :columns])
+      {train, test} = Nx.split(tensor, 0.5, axis: :columns)
+
+      assert {4, 2} == Nx.shape(train)
+      assert {4, 2} == Nx.shape(test)
+    end
+
+    test "split into 70% for training and 30% for testing along a named :axis" do
+      tensor = Nx.iota({100, 6}, names: [:rows, :columns])
+      {train, test} = Nx.split(tensor, 70, axis: :rows)
+
+      assert {70, 6} == Nx.shape(train)
+      assert {30, 6} == Nx.shape(test)
+    end
+
+    test "split into 90% for training and 10% for testing along a named :axis" do
+      tensor = Nx.iota({2, 100}, names: [:rows, :columns])
+      {train, test} = Nx.split(tensor, 90, axis: :columns)
+
+      assert {2, 90} == Nx.shape(train)
+      assert {2, 10} == Nx.shape(test)
+    end
+
+    test "split into 50% for training and 50% for testing along the :axis 1" do
+      tensor = Nx.iota({100, 10})
+      {train, test} = Nx.split(tensor, 5, axis: 1)
+
+      assert {100, 5} == Nx.shape(train)
+      assert {100, 5} == Nx.shape(test)
+    end
+
+    test "split into 61% for training and 39% for testing" do
+      tensor = Nx.iota({100, 10})
+      {train, test} = Nx.split(tensor, 61)
+
+      assert {61, 10} == Nx.shape(train)
+      assert {39, 10} == Nx.shape(test)
+    end
+
+    test "split into 60% for training and 40% for testing with unbalanced data" do
+      tensor = Nx.iota({99, 4})
+
+      {train, test} = Nx.split(tensor, 60)
+
+      assert {60, 4} == Nx.shape(train)
+      assert {39, 4} == Nx.shape(test)
+    end
+  end
+
+  describe "logsumexp" do
+    test "removes the right axes" do
+      tensor = Nx.tensor([[[11.0], [12.0], [13.0]]])
+
+      assert Nx.logsumexp(tensor, axes: [0]) ==
+               Nx.tensor([
+                 [11.0],
+                 [12.0],
+                 [13.0]
+               ])
+
+      assert Nx.logsumexp(tensor, axes: [2]) ==
+               Nx.tensor([
+                 [11.0, 12.0, 13.0]
+               ])
+    end
+
+    test "works with infinities" do
+      tensor =
+        Nx.tensor([
+          [:infinity, :infinity, :infinity],
+          [:infinity, :infinity, :neg_infinity],
+          [:infinity, :infinity, 0.0],
+          [:infinity, :neg_infinity, :infinity],
+          [:infinity, :neg_infinity, :neg_infinity],
+          [:infinity, :neg_infinity, 0.0],
+          [:infinity, 0.0, :infinity],
+          [:infinity, 0.0, :neg_infinity],
+          [:infinity, 0.0, 0.0],
+          [:neg_infinity, :infinity, :infinity],
+          [:neg_infinity, :infinity, :neg_infinity],
+          [:neg_infinity, :infinity, 0.0],
+          [:neg_infinity, :neg_infinity, :infinity],
+          [:neg_infinity, :neg_infinity, :neg_infinity],
+          [:neg_infinity, :neg_infinity, 0.0],
+          [:neg_infinity, 0.0, :infinity],
+          [:neg_infinity, 0.0, :neg_infinity],
+          [:neg_infinity, 0.0, 0.0],
+          [0.0, :infinity, :infinity],
+          [0.0, :infinity, :neg_infinity],
+          [0.0, :infinity, 0.0],
+          [0.0, :neg_infinity, :infinity],
+          [0.0, :neg_infinity, :neg_infinity],
+          [0.0, :neg_infinity, 0.0],
+          [0.0, 0.0, :infinity],
+          [0.0, 0.0, :neg_infinity]
+        ])
+
+      assert Nx.logsumexp(tensor, axes: [1]) ==
+               Nx.tensor([
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :neg_infinity,
+                 0.0,
+                 :infinity,
+                 0.0,
+                 0.6931471824645996,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 :infinity,
+                 0.0,
+                 0.6931471824645996,
+                 :infinity,
+                 0.6931471824645996
+               ])
+    end
+  end
+
+  describe "quantized types" do
+    test "s2" do
+      tensor = Nx.s2([-2, -1, 1])
+      assert tensor.type == {:s, 2}
+
+      assert <<-2::2-signed-native, -1::2-signed-native, 1::2-signed-native>> =
+               Nx.to_binary(tensor)
+
+      assert [-2, -1, 1] = Nx.to_flat_list(tensor)
+      assert 0 = Nx.byte_size(tensor)
+      assert 6 = Nx.bit_size(tensor)
+
+      tensor = Nx.s2([-2, -1, 0, 1, 0, -1, -2])
+      assert 1 = Nx.byte_size(tensor)
+      assert 14 = Nx.bit_size(tensor)
+    end
+
+    test "s4" do
+      tensor = Nx.s4([-8, -1, 7])
+      assert tensor.type == {:s, 4}
+
+      assert <<-8::4-signed-native, -1::4-signed-native, 7::4-signed-native>> =
+               Nx.to_binary(tensor)
+
+      assert [-8, -1, 7] = Nx.to_flat_list(tensor)
+      assert 1 = Nx.byte_size(tensor)
+      assert 12 = Nx.bit_size(tensor)
+
+      tensor = Nx.s4([-8, -3, 0, 7, 0, -3, -8])
+      assert 3 = Nx.byte_size(tensor)
+      assert 28 = Nx.bit_size(tensor)
+    end
+
+    test "u2" do
+      tensor = Nx.u2([1, 2, 3])
+      assert tensor.type == {:u, 2}
+      assert <<1::2-native, 2::2-native, 3::2-native>> = Nx.to_binary(tensor)
+      assert [1, 2, 3] = Nx.to_flat_list(tensor)
+      assert 0 = Nx.byte_size(tensor)
+      assert 6 = Nx.bit_size(tensor)
+
+      tensor = Nx.u2([0, 1, 2, 3, 2, 1, 0])
+      assert 1 = Nx.byte_size(tensor)
+      assert 14 = Nx.bit_size(tensor)
+    end
+
+    test "u4" do
+      tensor = Nx.u4([0, 7, 15])
+      assert tensor.type == {:u, 4}
+      assert <<0::4-native, 7::4-native, 15::4-native>> = Nx.to_binary(tensor)
+      assert [0, 7, 15] = Nx.to_flat_list(tensor)
+      assert 1 = Nx.byte_size(tensor)
+      assert 12 = Nx.bit_size(tensor)
+
+      tensor = Nx.u4([0, 1, 2, 3, 13, 14, 15])
+      assert 3 = Nx.byte_size(tensor)
+      assert 28 = Nx.bit_size(tensor)
+    end
+  end
+
+  describe "slice of scalar tensor" do
+    test "returns scalar" do
+      t = Nx.tensor(42)
+      result = Nx.slice(t, [], [])
+      assert Nx.to_number(result) == 42
+    end
+
+    test "slice of scalar f64 tensor" do
+      t = Nx.tensor(3.14, type: :f64)
+      result = Nx.slice(t, [], [])
+      assert_in_delta Nx.to_number(result), 3.14, 1.0e-10
+    end
+  end
+
+  describe "slice shape errors" do
+    test "start indices length reports the shape and the indices" do
+      assert_raise ArgumentError,
+                   ~r/start indices for slice of shape \{2, 3\}.*got: \[0\]/,
+                   fn ->
+                     Nx.slice(Nx.iota({2, 3}), [0], [1, 1])
+                   end
+    end
+
+    test "lengths list reports the shape and the lengths" do
+      assert_raise ArgumentError,
+                   ~r/lengths for slice of shape \{2, 3\}.*got: \[1\]/,
+                   fn ->
+                     Nx.slice(Nx.iota({2, 3}), [0, 0], [1])
+                   end
+    end
+
+    test "strides list reports the shape and the strides" do
+      assert_raise ArgumentError,
+                   ~r/strides for slice of shape \{2, 3\}.*got: \[1\]/,
+                   fn ->
+                     Nx.slice(Nx.iota({2, 3}), [0, 0], [1, 1], strides: [1])
+                   end
     end
   end
 end

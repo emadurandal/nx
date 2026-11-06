@@ -5,16 +5,26 @@ defmodule Nx.HeatmapTest do
   @tensor1 Nx.tensor([1, 2, 3, 4, 5])
   @tensor2 Nx.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]])
   @tensor3 Nx.tensor([[[1, 2, 3], [4, 5, 6]], [[7, 8, 9], [10, 11, 12]]])
+  @non_finite Nx.tensor([:neg_infinity, -1, :nan, 1, :infinity])
 
   test "rank 0" do
     assert_raise ArgumentError, fn -> Nx.to_heatmap(@tensor0) end
   end
 
   describe "without ANSI" do
+    test "equal" do
+      assert Nx.tensor([1, 1, 1]) |> Nx.to_heatmap(ansi_enabled: false) |> inspect() == """
+             #Nx.Heatmap<
+               s32[3]
+               000
+             >\
+             """
+    end
+
     test "rank 1" do
       assert @tensor1 |> Nx.to_heatmap(ansi_enabled: false) |> inspect() == """
              #Nx.Heatmap<
-               s64[5]
+               s32[5]
                02579
              >\
              """
@@ -23,7 +33,7 @@ defmodule Nx.HeatmapTest do
     test "rank 2" do
       assert @tensor2 |> Nx.to_heatmap(ansi_enabled: false) |> inspect() == """
              #Nx.Heatmap<
-               s64[4][3]
+               s32[4][3]
              \s\s
                012
                234
@@ -36,7 +46,7 @@ defmodule Nx.HeatmapTest do
     test "rank 3" do
       assert @tensor3 |> Nx.to_heatmap(ansi_enabled: false) |> inspect() == """
              #Nx.Heatmap<
-               s64[2][2][3]
+               s32[2][2][3]
                [
                  024
                  579,
@@ -47,13 +57,59 @@ defmodule Nx.HeatmapTest do
              >\
              """
     end
+
+    test "vectorized 1 + rank 2" do
+      assert @tensor3 |> Nx.vectorize(:x) |> Nx.to_heatmap(ansi_enabled: false) |> inspect() ==
+               """
+               #Nx.Heatmap<
+                 vectorized[x: 2]
+                 s32[2][3]
+                 [
+                   024
+                   579,
+               \s\s\s\s
+                   024
+                   579
+                 ]
+               >\
+               """
+    end
+
+    test "non-finite" do
+      assert @non_finite |> Nx.to_heatmap(ansi_enabled: false) |> inspect() == """
+             #Nx.Heatmap<
+               f32[5]
+               -0x9+
+             >\
+             """
+
+      assert Nx.stack([@non_finite, @non_finite])
+             |> Nx.to_heatmap(ansi_enabled: false)
+             |> inspect() == """
+             #Nx.Heatmap<
+               f32[2][5]
+             \s\s
+               -0x9+
+               -0x9+
+             >\
+             """
+    end
   end
 
   describe "with ANSI" do
+    test "equal" do
+      assert Nx.tensor([1, 1, 1]) |> Nx.to_heatmap(ansi_enabled: true) |> inspect() == """
+             #Nx.Heatmap<
+               s32[3]
+               \e[48;5;232m　\e[48;5;232m　\e[48;5;232m　\e[0m
+             >\
+             """
+    end
+
     test "rank 1" do
       assert @tensor1 |> Nx.to_heatmap(ansi_enabled: true) |> inspect() == """
              #Nx.Heatmap<
-               s64[5]
+               s32[5]
                \e[48;5;232m\u3000\e[48;5;238m\u3000\e[48;5;244m\u3000\e[48;5;249m\u3000\e[48;5;255m\u3000\e[0m
              >\
              """
@@ -62,7 +118,7 @@ defmodule Nx.HeatmapTest do
     test "rank 2" do
       assert @tensor2 |> Nx.to_heatmap(ansi_enabled: true) |> inspect() == """
              #Nx.Heatmap<
-               s64[4][3]
+               s32[4][3]
              \s\s
                \e[48;5;232m\u3000\e[48;5;234m\u3000\e[48;5;236m\u3000\e[0m
                \e[48;5;238m\u3000\e[48;5;240m\u3000\e[48;5;242m\u3000\e[0m
@@ -75,7 +131,7 @@ defmodule Nx.HeatmapTest do
     test "rank 3" do
       assert @tensor3 |> Nx.to_heatmap(ansi_enabled: true) |> inspect() == """
              #Nx.Heatmap<
-               s64[2][2][3]
+               s32[2][2][3]
                [
                  \e[48;5;232m\u3000\e[48;5;237m\u3000\e[48;5;241m\u3000\e[0m
                  \e[48;5;246m\u3000\e[48;5;250m\u3000\e[48;5;255m\u3000\e[0m,
@@ -83,6 +139,15 @@ defmodule Nx.HeatmapTest do
                  \e[48;5;232m\u3000\e[48;5;237m\u3000\e[48;5;241m\u3000\e[0m
                  \e[48;5;246m\u3000\e[48;5;250m\u3000\e[48;5;255m\u3000\e[0m
                ]
+             >\
+             """
+    end
+
+    test "non-finite" do
+      assert @non_finite |> Nx.to_heatmap(ansi_enabled: true) |> inspect() == """
+             #Nx.Heatmap<
+               f32[5]
+               \e[48;5;232m∞\e[48;5;232m　\e[41m　\e[48;5;255m　\e[48;5;255m∞\e[0m
              >\
              """
     end

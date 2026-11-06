@@ -1,13 +1,15 @@
 defmodule MNIST do
   import Nx.Defn
 
-  @default_defn_compiler EXLA
-
   defn init_random_params do
-    w1 = Nx.random_normal({784, 128}, 0.0, 0.1, names: [:input, :layer])
-    b1 = Nx.random_normal({128}, 0.0, 0.1, names: [:layer])
-    w2 = Nx.random_normal({128, 10}, 0.0, 0.1, names: [:layer, :output])
-    b2 = Nx.random_normal({10}, 0.0, 0.1, names: [:output])
+    key = Nx.Random.key(42)
+    {w1, new_key} = Nx.Random.normal(key, 0.0, 0.1, shape: {784, 128}, names: [:input, :layer])
+    {b1, new_key} = Nx.Random.normal(new_key, 0.0, 0.1, shape: {128}, names: [:layer])
+
+    {w2, new_key} =
+      Nx.Random.normal(new_key, 0.0, 0.1, shape: {128, 10}, names: [:layer, :output])
+
+    {b2, _new_key} = Nx.Random.normal(new_key, 0.0, 0.1, shape: {10}, names: [:output])
     {w1, b1, w2, b2}
   end
 
@@ -19,7 +21,7 @@ defmodule MNIST do
     batch
     |> Nx.dot(w1)
     |> Nx.add(b1)
-    |> Nx.logistic()
+    |> Nx.sigmoid()
     |> Nx.dot(w2)
     |> Nx.add(b2)
     |> softmax()
@@ -59,7 +61,7 @@ defmodule MNIST do
   end
 
   defp unzip_cache_or_download(zip) do
-    base_url = 'https://storage.googleapis.com/cvdf-datasets/mnist/'
+    base_url = ~c"https://storage.googleapis.com/cvdf-datasets/mnist/"
     path = Path.join("tmp", zip)
 
     data =
@@ -90,7 +92,7 @@ defmodule MNIST do
       |> Nx.from_binary({:u, 8})
       |> Nx.reshape({n_images, n_rows * n_cols}, names: [:batch, :input])
       |> Nx.divide(255)
-      |> Nx.to_batched_list(30)
+      |> Nx.to_batched(30)
 
     IO.puts("#{n_images} #{n_rows}x#{n_cols} images\n")
 
@@ -101,41 +103,41 @@ defmodule MNIST do
       |> Nx.from_binary({:u, 8})
       |> Nx.reshape({n_labels, 1}, names: [:batch, :output])
       |> Nx.equal(Nx.tensor(Enum.to_list(0..9)))
-      |> Nx.to_batched_list(30)
+      |> Nx.to_batched(30)
 
     IO.puts("#{n_labels} labels\n")
 
     {train_images, train_labels}
   end
 
-  def train_epoch(cur_params, imgs, labels) do
+  def train_epoch(fun, cur_params, imgs, labels) do
     total_batches = Enum.count(imgs)
 
     imgs
-    |> Enum.zip(labels)
+    |> Stream.zip(labels)
     |> Enum.reduce({cur_params, Nx.tensor(0.0), Nx.tensor(0.0)}, fn
       {imgs, tar}, {cur_params, avg_loss, avg_accuracy} ->
-        update_with_averages(cur_params, imgs, tar, avg_loss, avg_accuracy, total_batches)
+        fun.(cur_params, imgs, tar, avg_loss, avg_accuracy, total_batches)
     end)
   end
 
-  def train(imgs, labels, params, opts \\ []) do
+  def train(fun, imgs, labels, params, opts \\ []) do
     epochs = opts[:epochs] || 5
 
     for epoch <- 1..epochs, reduce: params do
       cur_params ->
         {time, {new_params, epoch_avg_loss, epoch_avg_acc}} =
-          :timer.tc(__MODULE__, :train_epoch, [cur_params, imgs, labels])
+          :timer.tc(__MODULE__, :train_epoch, [fun, cur_params, imgs, labels])
 
         epoch_avg_loss =
           epoch_avg_loss
           |> Nx.backend_transfer()
-          |> Nx.to_scalar()
+          |> Nx.to_number()
 
         epoch_avg_acc =
           epoch_avg_acc
           |> Nx.backend_transfer()
-          |> Nx.to_scalar()
+          |> Nx.to_number()
 
         IO.puts("Epoch #{epoch} Time: #{time / 1_000_000}s")
         IO.puts("Epoch #{epoch} average loss: #{inspect(epoch_avg_loss)}")
@@ -146,18 +148,23 @@ defmodule MNIST do
   end
 end
 
+Nx.global_default_backend(EXLA.Backend)
+
 {train_images, train_labels} =
-  MNIST.download('train-images-idx3-ubyte.gz', 'train-labels-idx1-ubyte.gz')
+  MNIST.download(~c"train-images-idx3-ubyte.gz", ~c"train-labels-idx1-ubyte.gz")
 
 IO.puts("Initializing parameters...\n")
 params = MNIST.init_random_params()
 
+IO.puts("Wrap the training function in JIT")
+fun = EXLA.jit(&MNIST.update_with_averages/6)
+
 IO.puts("Training MNIST for 10 epochs...\n\n")
-final_params = MNIST.train(train_images, train_labels, params, epochs: 10)
+final_params = MNIST.train(fun, train_images, train_labels, params, epochs: 10)
 
 IO.puts("Bring the parameters back from the device and print them")
 final_params = Nx.backend_transfer(final_params)
 IO.inspect(final_params)
 
 IO.puts("The result of the first batch against the trained network")
-IO.inspect(MNIST.predict(hd(train_images)))
+IO.inspect(EXLA.jit(&MNIST.predict/2).(final_params, hd(Enum.to_list(train_images))))

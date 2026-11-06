@@ -1,136 +1,584 @@
 defmodule EXLA.Defn do
   @moduledoc false
 
-  alias Nx.Defn.{Expr, Tree}
+  require Logger
+  require EXLA.Defn.Outfeed, as: Outfeed
+  alias Nx.Defn.{Composite, Expr, Tree}
   alias Nx.Tensor, as: T
 
+  alias EXLA.Typespec
+  alias EXLA.MLIR.Value
+  alias EXLA.MLIR.Function
+  alias EXLA.CustomCall.Spec, as: CustomCallSpec
+
   @doc false
-  def __jit__(key, vars, fun, options) do
+  def __partitions_options__(options) do
+    client_name = Keyword.get_lazy(options, :client, &EXLA.Client.default_name/0)
+    device_count = EXLA.Client.fetch!(client_name).device_count
+
+    Enum.map(1..device_count//1, &Keyword.put(options, :device_id, &1 - 1))
+  end
+
+  @doc false
+  def __to_backend__(options) do
+    client_name = Keyword.get_lazy(options, :client, &EXLA.Client.default_name/0)
+
+    device_id =
+      Keyword.get_lazy(options, :device_id, fn ->
+        EXLA.Client.fetch!(client_name).default_device_id
+      end)
+
+    {EXLA.Backend, [client: client_name, device_id: device_id]}
+  end
+
+  @doc false
+  def __jit__(key, vars, fun, args_list, options) do
+    __compile__(key, vars, fun, options).(args_list)
+  end
+
+  @doc false
+  def __shard_jit__(key, mesh, vars, fun, args_list, options) do
+    # By the time we get here, `Nx.Defn.Compiler.__shard_jit__/5` has already
+    # validated `options[:input_shardings]` (converting it to list format, one
+    # entry per tensor leaf) and adjusted `vars` to their unsharded (full
+    # logical) shapes, so containers (e.g. an Axon.ModelState) are handled
+    # transparently, just like they are for regular (non-sharded) `jit`.
+    options = Keyword.put(options, :mesh, mesh)
+    compiled_fun = __compile__(key, vars, fun, options)
+
+    compiled_fun.([args_list])
+  end
+
+  @doc false
+  def __compile__(key, vars, fun, options) do
     {run_options, compile_options} = Keyword.pop(options, :run_options, [])
-    {buffers, outputs, executable} = compile(key, vars, fun, compile_options)
+    debug? = Keyword.get(compile_options, :debug, false)
 
-    executable
-    |> EXLA.Executable.run(buffers, run_options)
-    |> buffer_to_nx(outputs)
-  end
+    callback = &to_computation(&1, &2, &3, &4, &5, compile_options)
 
-  defp compile(key, vars, fun, options) do
-    expr_args = for var <- vars, do: nx_to_expr_key!(var)
-    expr_key = {key, expr_args}
+    {executable, {used_inputs, outputs, outfeed, _input_typespecs?}} =
+      compile(key, vars, fun, compile_options, 0, [], callback)
 
-    {expr, {inputs, outputs}} =
-      EXLA.LockedCache.run(expr_key, fn ->
-        expr = fun.(vars)
-        {expr, {used_inputs(expr), outputs(expr)}}
-      end)
+    case compile_options[:module_compilation] do
+      :to_mlir ->
+        throw({:mlir_module, executable.ref, MapSet.new(Map.keys(used_inputs)), outputs})
 
-    {client_name, options} = Keyword.pop(options, :client, :default)
-    {buffers, cache_args} = nx_to_buffer(vars, inputs)
-    cache_key = {key, cache_args, client_name, options}
+      :to_executable ->
+        throw({:executable, executable})
 
-    {_, executable} =
-      EXLA.LockedCache.run(cache_key, fn ->
-        shapes = Enum.map(buffers, & &1.shape)
-        inputs_and_shapes = Enum.zip(inputs, shapes)
-        computation = to_root_computation(key, expr || fun.(vars), inputs_and_shapes, options)
-        client = EXLA.Client.fetch!(client_name)
-        executable = EXLA.Computation.compile(computation, client, shapes)
-        :persistent_term.put(cache_key, executable)
-        {nil, executable}
-      end)
+      _ ->
+        :ok
+    end
 
-    {buffers, outputs, executable}
-  end
+    fn [args] ->
+      {time, lock} =
+        :timer.tc(fn ->
+          EXLA.Defn.Lock.lock(run_key(executable))
+        end)
 
-  defp used_inputs(expr) do
-    {_, {_, used_inputs}} = Tree.composite(expr, {%{}, %{}}, &used_inputs/2)
-    used_inputs |> Map.keys() |> Enum.sort()
-  end
+      debug? && Logger.debug("EXLA device #{executable.device_id} lock in #{us_to_ms(time)}ms")
 
-  defp used_inputs(%T{data: %Expr{op: :parameter, args: [i], context: :root}} = t, {seen, used}),
-    do: {t, {seen, Map.put(used, i, true)}}
+      {time, res} =
+        :timer.tc(fn ->
+          maybe_outfeed(
+            lock,
+            executable,
+            args,
+            used_inputs,
+            outputs,
+            outfeed,
+            run_options,
+            !!options[:mesh]
+          )
+        end)
 
-  defp used_inputs(%T{data: %Expr{id: id}} = t, {seen, used}) do
-    case seen do
-      %{^id => true} -> {t, {seen, used}}
-      %{} -> Tree.traverse_args(t, {Map.put(seen, id, true), used}, &used_inputs/2)
+      debug? &&
+        Logger.debug("EXLA execution on device #{executable.device_id} in #{us_to_ms(time)}ms")
+
+      res
     end
   end
 
-  defp outputs(%T{} = t),
-    do: %{t | data: nil}
-
-  defp outputs(tuple) when is_tuple(tuple),
-    do: {:tuple, tuple |> Tuple.to_list() |> Enum.map(&outputs/1)}
-
-  defp outputs(map) when is_struct(map) do
-    out =
-      map
-      |> Map.from_struct()
-      |> Enum.sort()
-      |> Enum.map(fn {k, v} -> {k, outputs(v)} end)
-
-    {:struct, out, map.__struct__}
-  end
-
-  defp outputs(map) when is_map(map),
-    do: {:map, map |> Enum.sort() |> Enum.map(fn {k, v} -> {k, outputs(v)} end)}
-
-  defp to_root_computation(key, expr, pos_shapes, options) do
-    builder = EXLA.Builder.new(inspect(key))
+  defp to_computation(
+         %Function{} = function,
+         expr,
+         used_typespecs,
+         outfeed,
+         client,
+         options
+       ) do
+    [callback_pid_value | function_args] = Function.get_arguments(function)
 
     params =
-      Enum.with_index(pos_shapes, fn {pos, shape}, i ->
-        {pos, EXLA.Op.parameter(builder, i, shape, "p#{i}")}
+      Enum.zip_with(used_typespecs, function_args, fn {pos, _typespec}, arg ->
+        {pos, arg}
       end)
 
+    unless client do
+      raise ArgumentError, "missing client"
+    end
+
     state = %{
-      precision: Keyword.get(options, :precision, :highest),
-      builder: builder,
-      params: Map.new(params)
+      client: client,
+      precision: Keyword.get(options, :precision, :default),
+      builder: function,
+      params: Map.new(params ++ outfeed.infeeds),
+      scope_ids: Tree.scope_ids(expr),
+      callback_pid_value: callback_pid_value
     }
 
-    expr
-    |> to_root_result(state, %{})
-    |> EXLA.Builder.build()
+    cache = lower_io_calls_in_order(expr, state, new_cache(outfeed))
+    {res, cache} = recur_flatten(expr, state, cache)
+    outfeed = cache |> get_outfeed() |> Outfeed.close(function)
+    Value.func_return(function, res)
+    outfeed
   end
 
-  defp to_root_result(composite, state, cache) do
-    {acc, _cache} = to_root_result(composite, [], state, cache)
-    EXLA.Op.tuple(state.builder, Enum.reverse(acc))
+  defp maybe_outfeed(
+         lock,
+         executable,
+         args,
+         used_inputs,
+         outputs,
+         outfeed,
+         run_options,
+         is_sharded?
+       )
+       when Outfeed.has_infeed_flags(outfeed) or Outfeed.has_callbacks(outfeed) do
+    if is_sharded? do
+      raise ArgumentError, "outfeed is not supported for sharded execution yet"
+    end
+
+    {buffers, infeeds} =
+      EXLA.Defn.Buffers.split_by_value(args, used_inputs, fn
+        arg, _i, nil -> EXLA.Defn.Buffers.from_nx!(arg, executable)
+        arg, i, _depth -> {i, EXLA.Defn.Buffers.from_nx!(arg, executable, transfer?: false)}
+      end)
+
+    infeeds = Map.new(infeeds)
+
+    {:ok, outfeed_pid} =
+      Outfeed.start_child(executable, outfeed, Process.group_leader(), infeeds)
+
+    ref = Process.monitor(outfeed_pid)
+
+    run_options = Keyword.put(run_options, :callback_server_pid, outfeed_pid)
+
+    {:ok, runner} =
+      EXLA.Defn.Runner.start_link(lock, fn ->
+        EXLA.Executable.run(executable, [Enum.reverse(buffers)], run_options)
+      end)
+
+    _ = EXLA.Defn.Lock.transfer(lock, fn -> send(runner, lock) end, outfeed_pid)
+
+    receive do
+      {:DOWN, ^ref, _, _, down_reason} ->
+        runner_result = EXLA.Defn.Runner.read(runner)
+
+        case {down_reason, runner_result} do
+          {{:shutdown, %EXLA.Defn.CallbackError{} = error}, _runner_result} ->
+            :erlang.raise(error.kind, error.reason, error.stacktrace)
+
+          {_down_reason, {:error, message}} ->
+            raise RuntimeError, message: message
+
+          {_down_reason, {:ok, results}} ->
+            Enum.map(results, fn result ->
+              EXLA.Defn.Buffers.to_nx!(result, outputs, executable.mesh)
+            end)
+        end
+    end
   end
 
-  defp to_root_result(%T{} = expr, acc, state, cache) do
-    {expr, cache} = recur_operator(expr, state, cache)
-    {[expr | acc], cache}
+  defp maybe_outfeed(
+         lock,
+         executable,
+         args,
+         used_inputs,
+         outputs,
+         _outfeed,
+         run_options,
+         is_sharded?
+       ) do
+    try do
+      args = if is_sharded?, do: args, else: [args]
+
+      # Check if args are pre-sliced (list of arglists for each partition)
+      input_lists =
+        Enum.with_index(args, fn partition_args, partition_index ->
+          # executable.device_id is -1 for sharded executables; use the partition index instead.
+          target_device_id = if is_sharded?, do: partition_index, else: executable.device_id
+
+          EXLA.Defn.Buffers.filter_by_indexes(partition_args, used_inputs, fn arg, _i ->
+            EXLA.Defn.Buffers.from_nx!(arg, executable, target_device_id: target_device_id)
+          end)
+        end)
+
+      case EXLA.Executable.run(executable, input_lists, run_options) do
+        {:ok, results} ->
+          Enum.map(results, fn result ->
+            EXLA.Defn.Buffers.to_nx!(result, outputs, executable.mesh)
+          end)
+
+        {:error, message} ->
+          raise RuntimeError, message: message
+      end
+    after
+      EXLA.Defn.Lock.unlock(lock)
+    end
   end
 
-  defp to_root_result(tuple, acc, state, cache) when is_tuple(tuple) do
-    list = Tuple.to_list(tuple)
+  defp run_key(%{client: %{platform: :host}, device_id: device_id}), do: [:host | device_id]
+  defp run_key(%{client: %{ref: ref}, device_id: device_id}), do: [ref | device_id]
 
-    Enum.reduce(list, {acc, cache}, fn expr, {acc, cache} ->
-      to_root_result(expr, acc, state, cache)
+  ## Compile
+
+  defp compile(
+         key,
+         vars,
+         fun,
+         options,
+         used_buffers,
+         used_inputs,
+         to_computation
+       ) do
+    {cache, options} = Keyword.pop(options, :cache, true)
+    {hooks, options} = Keyword.pop(options, :hooks, %{})
+
+    {debug?, options} = Keyword.pop(options, :debug, false)
+    {lazy_transfers, options} = Keyword.pop(options, :lazy_transfers, :opt_in)
+
+    {client_name, options} = Keyword.pop_lazy(options, :client, &EXLA.Client.default_name/0)
+    client = EXLA.Client.fetch!(client_name)
+    mesh = options[:mesh]
+    input_shardings = Keyword.get(options, :input_shardings, [])
+
+    if !mesh and input_shardings != [] do
+      raise ArgumentError,
+            "input sharding configuration provided but no device mesh was provided"
+    end
+
+    {args_key, {reverse_args_identifiers, donated_leaf_set, _idx}} =
+      Enum.map_reduce(vars, {[], MapSet.new(), 0}, fn var, acc ->
+        Nx.Defn.Composite.traverse(var, acc, fn
+          %T{vectorized_axes: vectorized_axes} = t, {acc, acc_donatable, idx} ->
+            %T{type: type, shape: shape, names: names} = Nx.devectorize(t)
+            identifier = {type, shape, names}
+            # Include donatable so donation sets miss the cache for non-donating ones.
+            cache_key = {type, shape, names, vectorized_axes, t.donatable?}
+
+            acc_donatable =
+              if t.donatable? do
+                MapSet.put(acc_donatable, idx)
+              else
+                acc_donatable
+              end
+
+            {cache_key, {[identifier | acc], acc_donatable, idx + 1}}
+        end)
+      end)
+
+    if MapSet.size(donated_leaf_set) > 0 and mesh != nil do
+      raise ArgumentError,
+            "buffer donation is not currently supported with sharded execution"
+    end
+
+    disk_key = %{
+      client: client.name,
+      args: args_key,
+      lazy_transfers: lazy_transfers,
+      hooks: Map.keys(hooks),
+      options: options
+    }
+
+    EXLA.Defn.Disk.cache(cache, client, disk_key, debug?, fn ->
+      {{expr_cache_fun, comp_cache_fun}, options} =
+        if cache do
+          Keyword.pop(options, EXLA, {&EXLA.Defn.LockedCache.run/2, &EXLA.Defn.LockedCache.run/2})
+        else
+          cache_fun = fn _key, fun -> fun.() end
+          {{cache_fun, cache_fun}, Keyword.delete(options, EXLA)}
+        end
+
+      {eval_time, {expr, {ref, outputs, {used_inputs, defined_io_calls}}}} =
+        :timer.tc(fn ->
+          expr_cache_fun.({key, args_key, lazy_transfers}, fn ->
+            expr = fun.(vars)
+
+            inputs_and_io_calls =
+              Outfeed.used_inputs_and_io_calls(expr, used_inputs, lazy_transfers)
+
+            # A parameter returned as is keeps the donatable mark of the
+            # argument behind it. The caller owns whatever comes back and has
+            # not asked to donate it again, so results are never donatable.
+            outputs =
+              expr
+              |> Nx.to_template()
+              |> Nx.Defn.Composite.traverse(&%{&1 | donatable?: false})
+
+            {expr, {make_ref(), outputs, inputs_and_io_calls}}
+          end)
+        end)
+
+      if debug? do
+        hit_or_miss = if expr, do: "miss", else: "hit"
+
+        Logger.debug(
+          "EXLA defn evaluation #{inspect(key)} cache #{hit_or_miss} in #{us_to_ms(eval_time)}ms"
+        )
+      end
+
+      outfeed = Outfeed.new(hooks, defined_io_calls)
+      comp_key = {ref, client.name, outfeed.used_io_call_names, lazy_transfers, options}
+
+      {comp_time, {evaled, {xla_time, executable, inputs_and_typespecs, outfeed}}} =
+        :timer.tc(fn ->
+          comp_cache_fun.(comp_key, fn ->
+            {reverse_inputs_and_typespecs, reverse_infeeds} =
+              reverse_args_identifiers
+              |> Enum.reverse()
+              |> EXLA.Defn.Buffers.split_by_value(used_inputs, fn
+                {type, shape, _names}, i, nil -> {i, Typespec.tensor(type, shape)}
+                {type, shape, _names}, i, depth -> {i, depth, Typespec.tensor(type, shape)}
+              end)
+
+            inputs_and_typespecs = Enum.reverse(reverse_inputs_and_typespecs)
+
+            out_typespecs =
+              [outputs]
+              |> Nx.Defn.Composite.flatten_list()
+              |> Enum.map(fn t ->
+                t
+                |> Nx.devectorize()
+                |> then(&Typespec.tensor(&1.type, &1.shape))
+              end)
+
+            expr = expr || fun.(vars)
+            expr = Nx.Defn.Composite.traverse(expr, &Nx.devectorize/1)
+            callback_pid_typespec = EXLA.Executable.callback_server_pid_typespec()
+
+            user_args_with_leaf_index =
+              for {i, typespec} <- inputs_and_typespecs, i >= used_buffers, do: {i, typespec}
+
+            comp_typespecs = Enum.map(user_args_with_leaf_index, fn {_, ts} -> ts end)
+            comp_typespecs = [callback_pid_typespec | comp_typespecs]
+
+            alias_pairs =
+              compute_alias_pairs!(donated_leaf_set, user_args_with_leaf_index, out_typespecs)
+
+            EXLA.MLIR.Module.new(comp_typespecs, out_typespecs, fn builder ->
+              # Add device mesh to module if provided
+              if mesh do
+                EXLA.MLIR.Module.add_mesh(builder.module, mesh)
+
+                # Apply sharding annotations to function arguments if provided
+                Enum.with_index(input_shardings, fn sharding, arg_index ->
+                  Function.set_arg_sharding(builder, arg_index + 1, {mesh, sharding})
+                end)
+              end
+
+              for {arg_index, output_index} <- alias_pairs do
+                Function.set_arg_aliasing(builder, arg_index, output_index)
+              end
+
+              # Only create the token when it will actually be used, that is:
+              # streaming (infeed/outfeed) or lazy transfers
+
+              outfeed =
+                if reverse_infeeds != [] do
+                  outfeed
+                  |> Outfeed.with_token(Value.create_token(builder))
+                  |> Outfeed.add_infeeds(builder, reverse_infeeds)
+                else
+                  outfeed
+                end
+
+              outfeed = to_computation.(builder, expr, inputs_and_typespecs, outfeed, client)
+
+              # Compute num_partitions from mesh and enable SPMD if mesh is provided
+              options =
+                if mesh do
+                  num_partitions = Tuple.product(mesh.shape)
+
+                  options
+                  |> Keyword.put(:num_partitions, num_partitions)
+                  |> Keyword.put(:use_spmd, true)
+                else
+                  options
+                end
+
+              {xla_time, executable} =
+                :timer.tc(fn ->
+                  EXLA.MLIR.Module.compile(
+                    builder.module,
+                    client,
+                    comp_typespecs,
+                    builder.return_typespecs,
+                    options
+                  )
+                end)
+
+              {:ok, {xla_time, executable, inputs_and_typespecs, %{outfeed | infeeds: []}}}
+            end)
+          end)
+        end)
+
+      cond do
+        not debug? ->
+          :ok
+
+        evaled ->
+          Logger.debug(
+            "EXLA compilation #{inspect(key)} cache miss in #{us_to_ms(comp_time)}ms (#{us_to_ms(xla_time)}ms in XLA)"
+          )
+
+        true ->
+          Logger.debug("EXLA compilation #{inspect(key)} cache hit in #{us_to_ms(comp_time)}ms")
+      end
+
+      if expr || evaled do
+        measurements = %{
+          eval_time: eval_time,
+          compile_time: comp_time,
+          total_time: eval_time + comp_time
+        }
+
+        :telemetry.execute([:exla, :compilation], measurements, %{key: key})
+      end
+
+      if evaled && cache, do: check_recompilation(key, args_key, outputs)
+
+      outfeed = Outfeed.with_user_io_calls(outfeed, hooks)
+
+      {executable, {used_inputs, outputs, outfeed, inputs_and_typespecs}}
     end)
   end
 
-  defp to_root_result(map, acc, state, cache) when is_struct(map) do
-    map
-    |> Map.from_struct()
-    |> Enum.sort()
-    |> Enum.reduce({acc, cache}, fn {_, expr}, {acc, cache} ->
-      to_root_result(expr, acc, state, cache)
-    end)
+  defp check_recompilation(key, args_key, outputs) do
+    threshold = Application.get_env(:exla, :check_recompilation, :infinity)
+
+    if is_integer(threshold) do
+      {:module, mod} = :erlang.fun_info(key, :module)
+      {:new_index, idx} = :erlang.fun_info(key, :new_index)
+      {:env, env} = :erlang.fun_info(key, :env)
+
+      out_key =
+        [outputs]
+        |> Nx.Defn.Composite.flatten_list()
+        |> Enum.map(&{&1.type, &1.shape})
+
+      # Normalize the env by replacing %Nx.Tensor{} values with {type, shape}
+      # so the counter key is stable for same-shaped tensors but distinguishes
+      # closures that capture different non-tensor metadata (e.g. different block ops).
+      normalized_env = normalize_env(env)
+
+      count = EXLA.Defn.LockedCache.count({mod, idx, args_key, out_key, normalized_env})
+
+      if count == threshold do
+        Logger.warning(
+          "EXLA has compiled #{inspect(key)} #{count} times with the same input " <>
+            "shapes. This typically means tensor values are being captured inside a " <>
+            "closure passed to defn, jit, or value_and_grad. Each distinct captured " <>
+            "value forces a full recompilation. Pass changing tensors as explicit " <>
+            "function arguments instead."
+        )
+      end
+    end
   end
 
-  defp to_root_result(map, acc, state, cache) when is_map(map) do
-    map
-    |> Enum.sort()
-    |> Enum.reduce({acc, cache}, fn {_, expr}, {acc, cache} ->
-      to_root_result(expr, acc, state, cache)
-    end)
+  defp normalize_env(env) when is_list(env), do: Enum.map(env, &normalize_env_value/1)
+
+  defp normalize_env_value(%Nx.Tensor{type: type, shape: shape}), do: {type, shape}
+
+  defp normalize_env_value(v) when is_list(v) do
+    map_improper_list(v, &normalize_env_value/1, [])
+  end
+
+  defp normalize_env_value(v) when is_tuple(v),
+    do: v |> Tuple.to_list() |> Enum.map(&normalize_env_value/1) |> List.to_tuple()
+
+  defp normalize_env_value(v) when is_map(v) and not is_struct(v),
+    do: Map.new(v, fn {k, val} -> {normalize_env_value(k), normalize_env_value(val)} end)
+
+  defp normalize_env_value(v), do: v
+
+  # Tail-recursive improper list map that handles both proper and improper lists.
+  defp map_improper_list([h | t], fun, acc) when is_list(t) do
+    map_improper_list(t, fun, [fun.(h) | acc])
+  end
+
+  defp map_improper_list([h | t], fun, acc) do
+    # t is not a list: improper tail
+    result = [fun.(h) | fun.(t)]
+    :lists.reverse(acc, result)
+  end
+
+  defp map_improper_list([], _fun, acc), do: :lists.reverse(acc)
+
+  defp us_to_ms(time), do: Float.round(time / 1000, 1)
+
+  ## Buffer donation
+
+  defp compute_alias_pairs!(donated_leaf_set, user_args_with_leaf_index, out_typespecs) do
+    if MapSet.size(donated_leaf_set) == 0 do
+      []
+    else
+      # Map leaf index -> {0-based MLIR position among user args, typespec}.
+      positions =
+        user_args_with_leaf_index
+        |> Enum.with_index(fn {leaf_idx, ts}, k -> {leaf_idx, {k, ts}} end)
+        |> Map.new()
+
+      out_with_index = Enum.with_index(out_typespecs)
+
+      {pairs, _used_outs} =
+        donated_leaf_set
+        |> Enum.sort()
+        |> Enum.map_reduce(MapSet.new(), fn leaf_idx, used_outs ->
+          case Map.fetch(positions, leaf_idx) do
+            {:ok, {k, in_ts}} ->
+              out_idx =
+                Enum.find_value(out_with_index, fn {out_ts, j} ->
+                  if not MapSet.member?(used_outs, j) and
+                       out_ts.shape == in_ts.shape and out_ts.type == in_ts.type do
+                    j
+                  end
+                end)
+
+              case out_idx do
+                nil ->
+                  raise ArgumentError,
+                        "input marked for donation has no output with matching shape " <>
+                          "#{inspect(in_ts.shape)} and type #{inspect(in_ts.type)}; " <>
+                          "cannot alias this argument"
+
+                j ->
+                  # +1 accounts for the callback_pid arg prepended at MLIR index 0.
+                  {{k + 1, j}, MapSet.put(used_outs, j)}
+              end
+
+            :error ->
+              raise ArgumentError,
+                    "argument marked for donation is not used by the " <>
+                      "computation; only used inputs can be donated"
+          end
+        end)
+
+      pairs
+    end
   end
 
   ## Operator handling
+
+  defp recur_flatten(composite, state, cache) do
+    {acc, cache} =
+      Composite.reduce(composite, {[], cache}, fn %T{} = expr, {acc, cache} ->
+        {expr, cache} = recur_operator(expr, state, cache)
+        {[acc, expr], cache}
+      end)
+
+    {List.flatten(acc), cache}
+  end
 
   defp recur_operator(%T{data: %Expr{id: id, op: op}} = expr, state, cache) do
     case cache do
@@ -138,17 +586,42 @@ defmodule EXLA.Defn do
         {res, cache}
 
       %{} ->
-        {res, cache} = cached_recur_operator(op, expr, state, cache)
+        {res, cache} = cached_recur_operator(op, Nx.devectorize(expr), state, cache)
         {res, Map.put(cache, id, res)}
     end
   end
 
-  defp cached_recur_operator(:while, %T{data: %Expr{args: args}}, state, cache) do
-    [initial, arg, condition, body] = args
-    {initial, cache} = recur_composite(initial, state, cache)
-    condition = recur_computation(:while_condition, [arg], condition, {:pred, 8}, state)
-    body = recur_computation(:while_body, [arg], body, :any, state)
-    {EXLA.Op.while(condition, body, initial), cache}
+  defp cached_recur_operator(
+         :while,
+         %T{data: %Expr{args: args}},
+         %{builder: %Function{} = function} = state,
+         cache
+       ) do
+    [initial_arg, _arg, pred, body] = args
+
+    {initial, cache} = recur_composite(initial_arg, state, cache)
+
+    initial =
+      if token = get_token(cache) do
+        [token | initial]
+      else
+        initial
+      end
+
+    {pred_computation, cache} = mlir_while_computation(pred, initial, {:pred, 8}, state, cache)
+    {body_computation, cache} = mlir_while_computation(body, initial, :with_token, state, cache)
+
+    results =
+      Value.while(function, pred_computation, body_computation, List.flatten(initial))
+
+    if get_token(cache) do
+      [token | results] = results
+      result = wrap_tuple_result(results, initial_arg)
+      {result, update_token(cache, token)}
+    else
+      result = wrap_tuple_result(results, initial_arg)
+      {result, cache}
+    end
   end
 
   defp cached_recur_operator(:cond, %T{data: %Expr{args: args}} = t, state, cache) do
@@ -164,7 +637,9 @@ defmodule EXLA.Defn do
           clauses
           |> Enum.reverse()
           |> Enum.reduce(last, fn {pred, on_true}, on_false ->
-            put_in(t.data.args, [[{pred, on_true}], on_false])
+            update_in(t.data, fn data ->
+              %{data | args: [[{pred, on_true}], on_false], id: make_ref()}
+            end)
           end)
 
         to_if(pred, on_true, on_false, state, cache)
@@ -175,118 +650,543 @@ defmodule EXLA.Defn do
     {Map.fetch!(state.params, i), cache}
   end
 
-  defp cached_recur_operator(:fun, expr, _state, cache) do
-    {expr, cache}
+  defp cached_recur_operator(:fun, %T{data: %Expr{args: args}, type: type}, state, cache) do
+    [args, expr, {_, _, _}] = args
+    {fun_computation(args, expr, type, state), cache}
+  end
+
+  # StableHLO-style lowering (gather, top_k, fft): not the C custom_call path;
+  # see `EXLA.CustomCall` for blocks that delegate to native CPU kernels.
+
+  defp cached_recur_operator(
+         :block,
+         %T{
+           data: %Expr{
+             args: [%Nx.Block.Take{axis: axis}, [tensor, indices], expr, _callback]
+           }
+         },
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+    {indices, cache} = recur_operator(indices, state, cache) |> unwrap_single_tensor!()
+
+    tensor_rank = tensor |> op_shape() |> tuple_size()
+    indices_rank = indices |> op_shape() |> tuple_size()
+    result_rank = tensor_rank - 1 + indices_rank
+
+    index_vector_dim = indices_rank
+    slice_sizes = tensor |> op_shape() |> put_elem(axis, 1) |> Tuple.to_list()
+
+    {left, right} = result_rank |> axes_for_rank() |> Enum.split(axis)
+    offset_dims = left ++ Enum.drop(right, indices_rank)
+
+    collapsed_slice_dims = [axis]
+    start_index_map = [axis]
+
+    result =
+      Value.gather(
+        tensor,
+        indices,
+        index_vector_dim,
+        slice_sizes,
+        offset_dims,
+        collapsed_slice_dims,
+        start_index_map,
+        expr_to_typespec(expr)
+      )
+
+    {result, cache}
+  end
+
+  defp cached_recur_operator(
+         :block,
+         %T{data: %Expr{args: [%Nx.Block.TopK{k: k}, [tensor], expr, _callback]}},
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+    {values, idx} = expr
+    typespecs = [expr_to_typespec(values), expr_to_typespec(idx)]
+    results = Value.top_k(tensor, k, typespecs)
+    {results, cache}
+  end
+
+  defp cached_recur_operator(
+         :block,
+         %T{data: %Expr{args: [%Nx.Block.FFT2{} = fft2_struct, [tensor], expr, _callback]}},
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+
+    opts = [lengths: fft2_struct.lengths, axes: fft2_struct.axes]
+    opts = if eps = fft2_struct.eps, do: Keyword.put(opts, :eps, eps), else: opts
+
+    {fft2(&Value.fft(&1, :fft, &2, &3), [tensor, opts], expr), cache}
+  end
+
+  defp cached_recur_operator(
+         :block,
+         %T{data: %Expr{args: [%Nx.Block.IFFT2{} = ifft2_struct, [tensor], expr, _callback]}},
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+
+    opts = [lengths: ifft2_struct.lengths, axes: ifft2_struct.axes]
+    opts = if eps = ifft2_struct.eps, do: Keyword.put(opts, :eps, eps), else: opts
+
+    {fft2(&Value.fft(&1, :ifft, &2, &3), [tensor, opts], expr), cache}
+  end
+
+  defp cached_recur_operator(
+         :block,
+         %T{data: %Expr{args: [%Nx.Block.RFFT{} = rfft_struct, [tensor], expr, _callback]}},
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+
+    opts = [length: rfft_struct.length, axis: rfft_struct.axis]
+    opts = if eps = rfft_struct.eps, do: Keyword.put(opts, :eps, eps), else: opts
+
+    input_type = Nx.Type.to_real(expr.type)
+
+    {fft(&Value.fft(&1, :rfft, &2, &3), input_type, expr.type, [tensor, opts], expr), cache}
+  end
+
+  defp cached_recur_operator(
+         :block,
+         %T{data: %Expr{args: [%Nx.Block.IRFFT{} = irfft_struct, [tensor], expr, _callback]}},
+         state,
+         cache
+       ) do
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+
+    opts = [length: irfft_struct.length, axis: irfft_struct.axis]
+    opts = if eps = irfft_struct.eps, do: Keyword.put(opts, :eps, eps), else: opts
+
+    n = irfft_struct.length
+    input_type = Nx.Type.to_complex(expr.type)
+
+    {fft(
+       &Value.fft(&1, :irfft, &2, &3),
+       input_type,
+       expr.type,
+       div(n, 2) + 1,
+       [tensor, opts],
+       expr
+     ), cache}
+  end
+
+  # C-backed custom_call blocks (QR, Eigh, …): `EXLA.CustomCall`; else compile default callback.
+  defp cached_recur_operator(
+         :block,
+         %T{data: %Expr{args: [struct, in_args, out, _callback]}},
+         %{client: client, builder: %Function{}} = state,
+         cache
+       ) do
+    # A container argument contributes its tensors to the compiled function's
+    # parameters in traversal order, matching the body's parameter positions.
+    {call_args, cache} =
+      in_args
+      |> Composite.flatten_list()
+      |> Enum.map_reduce(cache, &recur_operator(&1, state, &2))
+
+    case EXLA.CustomCall.call(struct, out, in_args, client) do
+      :skip ->
+        default_block_implementation(struct, call_args, out, state, cache)
+
+      {:ok, %CustomCallSpec{} = spec} ->
+        dictionary_entries =
+          case spec.attributes do
+            list when is_list(list) ->
+              list
+
+            other ->
+              raise ArgumentError,
+                    "EXLA.CustomCall.Spec attributes must be a list of {binary_key, binary_attr} pairs, got: #{inspect(other)}"
+          end
+
+        mlir_attributes =
+          if is_list(spec.mlir_attributes) do
+            spec.mlir_attributes
+          else
+            raise ArgumentError,
+                  "EXLA.CustomCall.Spec mlir_attributes must be a list of {binary_key, binary_attr} pairs, got: #{inspect(spec.mlir_attributes)}"
+          end
+
+        call_args = cast_custom_call_operands(call_args, spec.operand_element_types)
+
+        out_typespecs =
+          [out]
+          |> Composite.flatten_list()
+          |> Enum.map(&expr_to_typespec/1)
+
+        lowered =
+          Value.custom_call(
+            call_args,
+            out_typespecs,
+            spec.call_target_name,
+            dictionary_entries,
+            mlir_attributes
+          )
+          |> wrap_tuple_result(out)
+
+        {lowered, cache}
+
+      other ->
+        raise ArgumentError,
+              "EXLA.CustomCall.call/4 must return :skip or {:ok, %EXLA.CustomCall.Spec{}}, got: #{inspect(other)}"
+    end
+  end
+
+  defp cached_recur_operator(
+         :io_call,
+         %T{
+           data: %Expr{
+             id: id,
+             args: [tensor_expr, callback_spec, _template, _ref]
+           }
+         } = io_call_expr,
+         %{client: %EXLA.Client{platform: platform}, callback_pid_value: callback_pid_value} =
+           state,
+         cache
+       )
+       when platform in [:host, :cuda] do
+    {reverse_arg_values, reverse_typespecs, cache, num_aliased} =
+      Composite.reduce(tensor_expr, {[], [], cache, 0}, fn %T{} = expr,
+                                                           {acc, typespecs, cache, num_aliased} ->
+        {value, cache} = recur_operator(expr, state, cache) |> unwrap_single_tensor!()
+        {[value | acc], [Value.get_typespec(value) | typespecs], cache, num_aliased + 1}
+      end)
+
+    arg_values = Enum.reverse(reverse_arg_values)
+    leaf_typespecs = Enum.reverse(reverse_typespecs)
+    arg_template = Nx.to_template(tensor_expr)
+
+    cache = add_callback(cache, {id, callback_spec, nil, arg_template})
+
+    unless callback_pid_value do
+      raise "internal bug: io_call callback pid operand is missing"
+    end
+
+    # Independent io_calls have no data dependency, so the compiler may run them in any
+    # order. Tie this one to the output of the previous io_call to keep the defined order.
+    [callback_pid_value | arg_values] =
+      order_after_last_io_call([callback_pid_value | arg_values], cache)
+
+    aliased_outputs =
+      Value.host_callback([callback_pid_value | arg_values], leaf_typespecs, id, num_aliased)
+
+    cache = put_last_io_call(cache, aliased_outputs)
+
+    {wrap_tuple_result(aliased_outputs, io_call_expr), cache}
+  end
+
+  defp cached_recur_operator(
+         :io_call,
+         _expr,
+         %{client: %EXLA.Client{platform: platform}},
+         _cache
+       ) do
+    raise """
+    Nx.io_call/3 is currently only supported for EXLA CPU (platform: :host) and CUDA (platform: :cuda),
+    but the active EXLA client is configured for platform #{inspect(platform)}.
+    Please run on the :host or :cuda client or wait for future segmentation-based support.
+    """
+  end
+
+  defp cached_recur_operator(
+         :runtime_call,
+         %T{data: %Expr{id: id, args: [tensor_expr, fun, out_template, opts]}} = expr,
+         %{client: %EXLA.Client{platform: platform}, callback_pid_value: callback_pid_value} =
+           state,
+         cache
+       )
+       when platform in [:host, :cuda] do
+    tensor_exprs = Composite.flatten_list([tensor_expr])
+
+    {arg_values, cache} =
+      Enum.map_reduce(tensor_exprs, cache, fn arg, cache ->
+        recur_operator(arg, state, cache) |> unwrap_single_tensor!()
+      end)
+
+    arg_template = Nx.to_template(tensor_expr)
+    typespecs = container_to_typespecs(out_template)
+
+    cache = add_callback(cache, {id, fun, out_template, arg_template, opts})
+
+    unless callback_pid_value do
+      raise "internal bug: runtime_call callback pid operand is missing"
+    end
+
+    results = Value.runtime_call([callback_pid_value | arg_values], typespecs, id)
+
+    {wrap_tuple_result(results, expr), cache}
+  end
+
+  defp cached_recur_operator(
+         :runtime_call,
+         _expr,
+         %{client: %EXLA.Client{platform: platform}},
+         _cache
+       ) do
+    raise """
+    Nx.runtime_call/4 is currently only supported for EXLA CPU (platform: :host) and CUDA (platform: :cuda),
+    but the active EXLA client is configured for platform #{inspect(platform)}.
+    Please run on the :host or :cuda client or wait for future segmentation-based support.
+    """
+  end
+
+  defp cached_recur_operator(
+         :lu,
+         %T{
+           data: %Expr{args: [{p_expr, l_expr, u_expr}, %{type: {type_kind, _}} = tensor, _opts]}
+         },
+         %{client: %{platform: :host}} = state,
+         cache
+       )
+       when type_kind != :c do
+    # We only want to accelerate the LU operation for real inputs on the host device.
+    # Otherwise, we use the default implementation in Nx.
+    {tensor, cache} = recur_operator(tensor, state, cache) |> unwrap_single_tensor!()
+
+    tensor =
+      if op_type(tensor) != u_expr.type do
+        to_type(tensor, u_expr.type)
+      else
+        tensor
+      end
+
+    {p, l, u} =
+      Value.lu(
+        tensor,
+        expr_to_typespec(p_expr),
+        expr_to_typespec(l_expr),
+        expr_to_typespec(u_expr)
+      )
+
+    {[p, l, u], cache}
   end
 
   defp cached_recur_operator(op, expr, state, cache) do
-    {args, cache} = Tree.traverse_args(expr, cache, &recur_operator(&1, state, &2))
+    {args, cache} = Tree.apply_args(expr, cache, &recur_operator(&1, state, &2))
     {to_operator(op, args, expr, state), cache}
+  end
+
+  defp cast_custom_call_operands(call_args, :default), do: call_args
+
+  defp cast_custom_call_operands(call_args, types) when is_list(types) do
+    n = length(call_args)
+
+    if length(types) != n do
+      raise ArgumentError,
+            "EXLA.CustomCall.Spec operand_element_types must be a list of length #{n} (one per block input), got length #{length(types)}"
+    end
+
+    Enum.zip_with(call_args, types, fn arg, desired ->
+      ts = Value.get_typespec(arg)
+
+      if ts.type == desired do
+        arg
+      else
+        Value.convert(arg, Typespec.tensor(desired, ts.shape))
+      end
+    end)
+  end
+
+  defp cast_custom_call_operands(_call_args, other) do
+    raise ArgumentError,
+          "EXLA.CustomCall.Spec operand_element_types must be :default or a list of Nx types, got: #{inspect(other)}"
+  end
+
+  defp default_block_implementation(struct, call_args, expr, state, cache) do
+    # Block callbacks can return vectorized tensors. The compiled function
+    # signature includes those axes, just like its input operands.
+    expr = Composite.traverse(expr, &Nx.devectorize/1)
+
+    {call_body, cache} =
+      block_computation(block_subfunction_description(struct), call_args, expr, state, cache)
+
+    if token = get_token(cache) do
+      typespecs = [Typespec.token() | container_to_typespecs(expr)]
+      [token | result] = Value.call(state.builder, [token | call_args], call_body, typespecs)
+      {wrap_tuple_result(result, expr), update_token(cache, token)}
+    else
+      typespecs = container_to_typespecs(expr)
+      result = Value.call(state.builder, call_args, call_body, typespecs)
+      {wrap_tuple_result(result, expr), cache}
+    end
   end
 
   ## to_operator creation
 
-  defp to_operator(:scalar, [scalar], ans, state) do
-    op = to_constant(state.builder, scalar, ans.type)
+  defp to_operator(:constant, [constant], ans, state) do
+    op = to_constant(state.builder, constant, ans.type)
 
     if ans.shape == {} do
       op
     else
-      EXLA.Op.broadcast_in_dim(op, ans.shape, {})
+      Value.broadcast_in_dim(op, [], expr_to_typespec(ans))
     end
   end
 
   defp to_operator(:tensor, [tensor], _ans, state) do
+    tensor = Nx.devectorize(tensor)
+
     case tensor.shape do
       {} ->
-        to_constant(state.builder, Nx.to_scalar(tensor), tensor.type)
+        to_constant(state.builder, Nx.to_number(tensor), tensor.type)
 
       shape ->
-        shape = EXLA.Shape.make_shape(tensor.type, shape)
-        EXLA.Op.constant_from_binary(state.builder, Nx.to_binary(tensor), shape)
+        Value.constant(
+          state.builder,
+          Nx.to_flat_list(tensor),
+          Typespec.tensor(tensor.type, shape)
+        )
     end
   end
 
-  defp to_operator(:random_uniform, [min, max], %{type: type, shape: shape}, _state) do
-    if match?({int, size} when int in [:s, :u] and size < 32, type) do
-      raise ArgumentError,
-            "Nx.random_uniform/4 for EXLA requires signed and unsigned tensors to be " <>
-              "at least of size 32, got: #{elem(type, 1)}"
-    end
-
-    min = to_type(min, type)
-    max = to_type(max, type)
-    shape = EXLA.Shape.make_shape(type, shape)
-    EXLA.Op.rng_uniform(min, max, shape)
+  defp to_operator(:iota, [axis], ans, state) do
+    EXLA.Lib.iota(state.builder, axis, expr_to_typespec(ans))
   end
 
-  defp to_operator(:random_normal, [mu, sigma], %{type: type, shape: shape}, _state) do
-    mu = to_type(mu, type)
-    sigma = to_type(sigma, type)
-    shape = EXLA.Shape.make_shape(type, shape)
-    EXLA.Op.rng_normal(mu, sigma, shape)
-  end
+  defp to_operator(:eye, [], %{type: type, shape: shape}, state) do
+    iota_type = Nx.Type.merge_number({:u, 8}, Tuple.product(shape))
+    iota_typespec = Typespec.tensor(iota_type, shape)
+    rank = tuple_size(shape)
 
-  defp to_operator(:iota, [axis], %{type: type, shape: shape}, state) do
-    shape = EXLA.Shape.make_shape(type, shape)
-    EXLA.Lib.iota(state.builder, shape, axis)
-  end
+    i0 = Value.iota(state.builder, rank - 2, iota_typespec)
+    i1 = Value.iota(state.builder, rank - 1, iota_typespec)
 
-  defp to_operator(:eye, [], %{type: type, shape: {n, n}}, state) do
-    iota_type = Nx.Type.merge_scalar({:u, 8}, n)
-    iota_shape = EXLA.Shape.make_shape(iota_type, {n, n})
-
-    i0 = EXLA.Op.iota(state.builder, iota_shape, 0)
-    i1 = EXLA.Op.iota(state.builder, iota_shape, 1)
-    to_type(EXLA.Op.equal(i0, i1), type)
+    typespec = Typespec.tensor({:pred, 8}, shape)
+    Value.equal(i0, i1, typespec) |> to_type(type)
   end
 
   ## to_operator shape
 
-  defp to_operator(:reshape, [op, shape], _ans, _state) do
-    EXLA.Op.reshape(op, shape)
+  defp to_operator(:reshape, [%Value{} = op], ans, _state) do
+    Value.reshape(op, expr_to_typespec(ans))
   end
 
-  defp to_operator(:pad, [op, value, padding_config], _ans, _state) do
-    EXLA.Op.pad(op, value, padding_config)
+  defp to_operator(:pad, [%Value{} = op, %Value{} = value, padding_config], ans, _state) do
+    Value.pad(
+      to_type(op, ans.type),
+      to_type(value, ans.type),
+      padding_config,
+      expr_to_typespec(ans)
+    )
   end
 
-  defp to_operator(:broadcast, [op, _shape, axes], ans, _state) do
-    EXLA.Op.broadcast_in_dim(op, ans.shape, List.to_tuple(axes))
+  defp to_operator(:broadcast, [%Value{} = op, _shape, axes], ans, _state) do
+    Value.broadcast_in_dim(to_type(op, ans.type), axes, expr_to_typespec(ans))
   end
 
-  defp to_operator(:transpose, [op, axes], _ans, _state) do
-    EXLA.Op.transpose(op, List.to_tuple(axes))
+  defp to_operator(:transpose, [%Value{} = op, axes], ans, _state) do
+    Value.transpose(op, axes, expr_to_typespec(ans))
   end
 
-  defp to_operator(:squeeze, [op, _axes], ans, _state) do
-    EXLA.Op.reshape(op, ans.shape)
+  defp to_operator(:squeeze, [%Value{} = op, _axes], ans, _state) do
+    Value.reshape(op, expr_to_typespec(ans))
   end
 
   ## to_operator others
 
-  defp to_operator(:metadata, [op, _metadata], _ans, _state) do
-    op
+  defp to_operator(:metadata, [op, %{barrier: true}], _ans, _state) do
+    case op do
+      %Value{} ->
+        [value] = Value.optimization_barrier([op])
+        value
+
+      op when is_tuple(op) ->
+        Value.optimization_barrier(Tuple.to_list(op))
+    end
   end
 
-  defp to_operator(:elem, [op, index, _size], _ans, _state) do
-    EXLA.Op.get_tuple_element(op, index)
+  defp to_operator(:metadata, [op, _metadata], _ans, _state) do
+    case op do
+      %Value{} ->
+        op
+
+      op when is_tuple(op) ->
+        Tuple.to_list(op)
+    end
+  end
+
+  defp to_operator(:elem, [op, index], _ans, _state) when is_list(op) do
+    Enum.fetch!(op, index)
   end
 
   defp to_operator(
          :dot,
-         [left, contract_axes1, batch_axes1, right, contract_axes2, batch_axes2],
-         %{type: type},
+         [
+           %Value{} = left,
+           contract_axes1,
+           batch_axes1,
+           %Value{} = right,
+           contract_axes2,
+           batch_axes2
+         ],
+         ans,
          state
        ) do
     precision = state.precision
 
-    EXLA.Op.dot_general(
-      to_type(left, type),
-      to_type(right, type),
+    Value.dot_general(
+      left,
+      right,
       {contract_axes1, batch_axes1, contract_axes2, batch_axes2},
-      precision
+      precision,
+      expr_to_typespec(ans)
     )
+  end
+
+  # XLA on CUDA rejects complex convolutions, so we split them into real
+  # ones, as Torchx does. A convolution is a sliding dot product, so we can
+  # decompose the dot product of a complex-valued pair of tensors into dot
+  # products of their real and imaginary components.
+  #
+  # For example, given a tensor v = [a1+b1i c1+d1i] and a
+  # kernel k = [a2+b2i c2+d2i], we can expand the dot product into
+  # (a1+b1i)(a2+b2i) + (c1+d1i)(c2+d2i)
+  # = (a1a2 - b1b2) + (a1b2+a2b1)i + (c1c2 - d1d2) + (c1d2+c2d1)i
+  # = (a1a2 + c1c2) - (b1b2 + d1d2) + i[(a1b2 + c1d2) + (a2b1 + c2d1)]
+  # = ([a1 c1].[a2 c2] - [b1 d1].[b2 d2]) + i([a1 c1].[b2 d2] + [a2 c2].[b1 d1])
+  # = (real(v).real(k) - imag(v).imag(k)) + i(real(v).imag(k) + imag(v).real(k))
+  #
+  # With the result above, z = conv(t, k), where either t or k is complex, becomes:
+  #
+  #     real = conv(re(t), re(k)) - conv(im(t), im(k))
+  #     imag = conv(re(t), im(k)) + conv(im(t), re(k))
+  #     z = complex(real, imag)
+  defp to_operator(
+         :conv,
+         [operand, kernel, opts],
+         %{type: {:c, _} = output_type} = ans,
+         %{client: %EXLA.Client{platform: :cuda}} = state
+       ) do
+    real_type = Nx.Type.to_real(output_type)
+
+    operand = to_type(operand, output_type)
+    kernel = to_type(kernel, output_type)
+
+    operand_ts = Typespec.to_type(Value.get_typespec(operand), real_type)
+    kernel_ts = Typespec.to_type(Value.get_typespec(kernel), real_type)
+    part_ts = Typespec.to_type(expr_to_typespec(ans), real_type)
+
+    re_t = Value.real(operand, operand_ts)
+    im_t = Value.imag(operand, operand_ts)
+    re_k = Value.real(kernel, kernel_ts)
+    im_k = Value.imag(kernel, kernel_ts)
+
+    conv = &convolution(&1, &2, opts, state, part_ts)
+
+    real_part = Value.subtract(conv.(re_t, re_k), conv.(im_t, im_k), part_ts)
+    imag_part = Value.add(conv.(re_t, im_k), conv.(im_t, re_k), part_ts)
+
+    Value.complex(real_part, imag_part, expr_to_typespec(ans))
   end
 
   defp to_operator(
@@ -295,294 +1195,317 @@ defmodule EXLA.Defn do
          ans,
          state
        ) do
-    padding = opts[:padding]
-    strides = opts[:strides]
-    input_dilation = opts[:input_dilation]
-    kernel_dilation = opts[:kernel_dilation]
-    feature_groups = opts[:feature_group_size]
-    batch_groups = opts[:batch_group_size]
-
     %{type: output_type} = ans
-
-    # Build general conv dims
-    input_permutation = List.to_tuple(opts[:input_permutation])
-    [out_features, in_features | spatial_features] = opts[:kernel_permutation]
-    kernel_permutation = List.to_tuple([in_features, out_features | spatial_features])
-
-    output_permutation =
-      opts[:output_permutation]
-      |> List.to_tuple()
-
-    conv_dim_nos = {input_permutation, kernel_permutation, output_permutation}
 
     # Ensure both types are floating
     operand = to_type(operand, output_type)
     kernel = to_type(kernel, output_type)
 
-    EXLA.Op.conv_general_dilated(
-      operand,
-      kernel,
-      strides,
-      padding,
-      input_dilation,
-      kernel_dilation,
-      conv_dim_nos,
-      feature_groups,
-      batch_groups,
-      state.precision
-    )
+    convolution(operand, kernel, opts, state, expr_to_typespec(ans))
   end
 
-  defp to_operator(:outer, [left, right], %{type: type, shape: shape}, _state) do
-    left =
-      left
-      |> to_type(type)
-      |> EXLA.Op.reshape({Nx.size(op_shape(left))})
-      |> EXLA.Op.broadcast_in_dim(shape, {0})
-
-    right =
-      right
-      |> to_type(type)
-      |> EXLA.Op.reshape({Nx.size(op_shape(right))})
-      |> EXLA.Op.broadcast_in_dim(shape, {1})
-
-    EXLA.Op.multiply(left, right)
-  end
-
-  defp to_operator(:select, [pred, on_true, on_false], %{type: type, shape: shape}, _state) do
+  defp to_operator(
+         :select,
+         [%Value{} = pred, %Value{} = on_true, %Value{} = on_false],
+         %{type: type, shape: shape} = ans,
+         _state
+       ) do
     pred = to_type(pred, {:pred, 8})
+
+    typespec = expr_to_typespec(ans)
 
     on_true =
       on_true
       |> to_type(type)
-      |> EXLA.Op.broadcast_in_dim(shape, broadcast_axes(op_shape(on_true), shape))
+      |> Value.broadcast_in_dim(broadcast_axes(op_shape(on_true), shape), typespec)
 
     on_false =
       on_false
       |> to_type(type)
-      |> EXLA.Op.broadcast_in_dim(shape, broadcast_axes(op_shape(on_false), shape))
+      |> Value.broadcast_in_dim(broadcast_axes(op_shape(on_false), shape), typespec)
 
-    EXLA.Op.select(pred, on_true, on_false)
+    Value.select(pred, on_true, on_false, typespec)
   end
 
-  defp to_operator(:triangular_solve, [a, b, opts], %{type: type}, _state) do
+  defp to_operator(
+         :triangular_solve,
+         args,
+         %{type: {:f, 16}} = ans,
+         %{client: %EXLA.Client{platform: :cuda}} = state
+       ) do
+    :triangular_solve
+    |> to_operator(args, %{ans | type: {:f, 32}}, state)
+    |> to_type({:f, 16})
+  end
+
+  defp to_operator(:triangular_solve, [%Value{} = a, b, opts], %{type: type} = ans, _state) do
     left_side = Keyword.fetch!(opts, :left_side)
     lower = Keyword.fetch!(opts, :lower)
     transform = Keyword.fetch!(opts, :transform_a)
 
-    case EXLA.Op.get_shape(b).dims do
-      {_} = b_shape ->
-        b =
-          b
-          |> to_type(type)
-          |> EXLA.Op.reshape(Tuple.append(b_shape, 1))
+    # StableHLO triangular_solve doesn't support conjugate-only transform,
+    # so we pre-conjugate A and use :none instead.
+    # For real types, conjugate is a no-op.
+    {a, transform} =
+      case transform do
+        :conjugate ->
+          if Nx.Type.complex?(type) do
+            a_typespec = Value.get_typespec(a)
+            {Value.conjugate(to_type(a, type), Typespec.to_type(a_typespec, type)), :none}
+          else
+            {a, :none}
+          end
 
-        to_type(a, type)
-        |> EXLA.Op.triangular_solve(b, left_side, lower, false, transform)
-        |> EXLA.Op.reshape(b_shape)
+        other ->
+          {a, other}
+      end
 
-      _ ->
-        to_type(a, type)
-        |> EXLA.Op.triangular_solve(to_type(b, type), left_side, lower, false, transform)
+    a_shape = Value.get_typespec(a).shape
+    b_shape = Value.get_typespec(b).shape
+
+    if tuple_size(a_shape) > tuple_size(b_shape) do
+      b_shape = Tuple.insert_at(b_shape, tuple_size(b_shape), 1)
+
+      b =
+        b
+        |> to_type(type)
+        |> Value.reshape(Typespec.tensor(type, b_shape))
+
+      typespec = Typespec.tensor(type, b_shape)
+
+      to_type(a, type)
+      |> Value.triangular_solve(b, left_side, lower, transform, typespec)
+      |> Value.reshape(Typespec.tensor(type, ans.shape))
+    else
+      typespec = Typespec.tensor(type, ans.shape)
+
+      to_type(a, type)
+      |> Value.triangular_solve(to_type(b, type), left_side, lower, transform, typespec)
     end
-  end
-
-  defp to_operator(:lu, [{_, _, _}, _tensor, _opts], _ans, _state) do
-    raise ArgumentError, "XLA does not currently support the LU operation"
-  end
-
-  defp to_operator(:qr, [{%{type: type}, %{type: type}}, tensor, opts], _ans, state) do
-    {q, r} = EXLA.Op.qr(to_type(tensor, type), opts[:mode] != :reduced)
-    EXLA.Op.tuple(state.builder, [q, r])
-  end
-
-  defp to_operator(
-         :svd,
-         [{%{type: type}, %{type: type}, %{type: type}}, tensor, _opts],
-         _ans,
-         state
-       ) do
-    {u, s, vt} = EXLA.Op.svd(to_type(tensor, type), state.precision)
-    EXLA.Op.tuple(state.builder, [u, s, vt])
   end
 
   ## to_operator element-wise
 
-  defp to_operator(:negate, [op], _ans, _state), do: EXLA.Op.negate(op)
+  defp to_operator(:negate, [%Value{} = op], ans, _state),
+    do: Value.negate(op, expr_to_typespec(ans))
 
-  defp to_operator(:abs, [op], _ans, _state), do: EXLA.Op.abs(op)
+  defp to_operator(:abs, [%Value{} = op], ans, _state), do: Value.abs(op, expr_to_typespec(ans))
 
-  defp to_operator(:sign, [op], %{type: type}, state) do
-    case type do
-      {:u, _} -> EXLA.Op.min(op, EXLA.Op.constant_r0(state.builder, 1, type))
-      _ -> EXLA.Op.sign(op)
+  defp to_operator(:sign, [%Value{} = op], ans, state) do
+    typespec = expr_to_typespec(ans)
+
+    case typespec.type do
+      {:u, _} ->
+        one = Value.constant(state.builder, [1], Typespec.to_shape(typespec, {}))
+
+        one
+        |> Value.broadcast_in_dim([], typespec)
+        |> Value.min(op, typespec)
+
+      _ ->
+        Value.sign(op, typespec)
     end
   end
 
-  defp to_operator(:right_shift, [left, right], %{type: type}, _state) do
-    dims = broadcast_axes(op_shape(left), op_shape(right))
-
+  defp to_operator(:right_shift, [%Value{} = left, %Value{} = right], out, _state) do
     op =
-      if match?({:u, _}, type),
+      if match?({:u, _}, out.type),
         do: :right_shift_logical,
         else: :right_shift_arithmetic
 
-    apply(EXLA.Op, op, [to_type(left, type), to_type(right, type), dims])
+    apply_mlir_broadcasted_bin_op(op, out, left, right)
   end
 
-  @bin_op [:add, :subtract, :multiply, :min, :max, :remainder, :power, :divide, :atan2] ++
+  @bin_op [:add, :subtract, :multiply, :min, :max, :remainder, :pow, :divide, :atan2] ++
             [:bitwise_and, :bitwise_or, :bitwise_xor, :left_shift]
 
-  defp to_operator(op, [left, right], %{type: type}, _state) when op in @bin_op do
-    dims = broadcast_axes(op_shape(left), op_shape(right))
-    apply(EXLA.Op, op, [to_type(left, type), to_type(right, type), dims])
+  defp to_operator(op, [%Value{} = left, %Value{} = right], out, _state)
+       when op in @bin_op do
+    apply_mlir_broadcasted_bin_op(op, out, left, right)
   end
 
-  defp to_operator(:quotient, [left, right], %{type: type}, _state) do
-    dims = broadcast_axes(op_shape(left), op_shape(right))
-    apply(EXLA.Op, :divide, [to_type(left, type), to_type(right, type), dims])
+  defp to_operator(:quotient, [left, right], ans, state) do
+    to_operator(:divide, [to_type(left, ans.type), to_type(right, ans.type)], ans, state)
   end
 
   @bin_comp_op [:equal, :not_equal, :greater, :less, :greater_equal, :less_equal]
 
-  defp to_operator(op, [left, right], _ans, _state) when op in @bin_comp_op do
-    # The answer type is always {:u, 8} but we need cast the inputs
-    # to the same type which is not necessarily the answer type.
-    left_shape = EXLA.Op.get_shape(left)
-    right_shape = EXLA.Op.get_shape(right)
-    type = merge_type(left_shape.dtype, right_shape.dtype)
-    dims = broadcast_axes(left_shape.dims, right_shape.dims)
-    apply(EXLA.Op, op, [to_type(left, type), to_type(right, type), dims])
+  defp to_operator(op, [%Value{} = left, %Value{} = right], ans, _state)
+       when op in @bin_comp_op do
+    apply_mlir_broadcasted_bin_op(op, ans, left, right)
   end
 
   @bin_pred_op [logical_and: :bitwise_and, logical_or: :bitwise_or, logical_xor: :bitwise_xor]
 
   for {logical, bitwise} <- @bin_pred_op do
-    defp to_operator(unquote(logical), [left, right], _ans, _state) do
-      type = {:pred, 8}
-      dims = broadcast_axes(op_shape(left), op_shape(right))
-      apply(EXLA.Op, unquote(bitwise), [to_type(left, type), to_type(right, type), dims])
+    defp to_operator(unquote(logical), [%Value{} = left, %Value{} = right], ans, _state) do
+      apply_mlir_broadcasted_bin_op(
+        unquote(bitwise),
+        ans,
+        to_mlir_logical(left),
+        to_mlir_logical(right)
+      )
     end
   end
 
-  @unary_op [:exp, :expm1, :log, :log1p, :logistic, :cos, :sin, :tanh, :sqrt, :rsqrt, :cbrt] ++
+  @unary_op [:exp, :expm1, :log, :log1p, :sigmoid, :cos, :sin, :tan, :tanh, :sqrt, :rsqrt, :cbrt] ++
               [:bitwise_not, :count_leading_zeros, :population_count, :cosh, :sinh, :acos] ++
               [:asin, :atan, :floor, :ceil, :round, :acosh, :asinh, :atanh, :erf] ++
-              [:erfc, :erf_inv]
+              [:erfc, :erf_inv, :conjugate]
 
-  defp to_operator(op, [arg], %{type: type}, _state) when op in @unary_op do
-    apply(EXLA.Op, op, [to_type(arg, type)])
+  defp to_operator(op, [%Value{} = arg], %{type: type} = ans, _state)
+       when op in @unary_op do
+    apply(Value, op, [to_type(arg, type), expr_to_typespec(ans)])
   end
 
-  @unary_lib_op [:tan]
+  defp to_operator(:fft, [%Value{} | _] = args, out, _state),
+    do: fft(&Value.fft(&1, :fft, &2, &3), out.type, out.type, args, out)
 
-  defp to_operator(op, [arg], %{type: type}, _state) when op in @unary_lib_op do
-    apply(EXLA.Lib, op, [to_type(arg, type)])
+  defp to_operator(:ifft, [%Value{} | _] = args, out, _state),
+    do: fft(&Value.fft(&1, :ifft, &2, &3), out.type, out.type, args, out)
+
+  defp to_operator(:is_nan, [%Value{} = arg], out, _state),
+    do: Value.is_nan(arg, expr_to_typespec(out))
+
+  defp to_operator(:is_infinity, [%Value{} = arg], out, _state),
+    do: Value.is_infinity(arg, expr_to_typespec(out))
+
+  # These operations do the type conversion implicitly, and so
+  # we cannot mess with the output type (e.g. the to_type conversion)
+  # because it will throw an error
+  @complex_op [:real, :imag]
+
+  defp to_operator(op, [%Value{} = arg], ans, _state)
+       when op in @complex_op do
+    maybe_cast_arg =
+      if Nx.Type.integer?(op_type(arg)) do
+        to_type(arg, ans.type)
+      else
+        arg
+      end
+
+    apply(Value, op, [maybe_cast_arg, expr_to_typespec(ans)])
   end
 
   defp to_operator(:as_type, [arg], %{type: type}, _state) do
     to_type(arg, type)
   end
 
-  defp to_operator(:bitcast, [arg], %{type: type}, _state) do
-    if op_type(arg) == type do
+  defp to_operator(:bitcast, [%Value{} = arg], ans, _state) do
+    if op_type(arg) == ans.type do
       arg
     else
-      EXLA.Op.bitcast_convert_type(arg, type)
+      Value.bitcast_convert(arg, expr_to_typespec(ans))
     end
   end
 
   ## to_operator reduction
 
-  defp to_operator(:all?, [arg, opts], _ans, state) do
-    to_aggregate(:all?, {:pred, 8}, {}, arg, 1, opts, state, binary_op_fun(:bitwise_and))
+  defp to_operator(:all, [arg, opts], %{shape: shape}, %{builder: %Function{}} = state) do
+    to_aggregate(:bitwise_and, {:u, 8}, shape, to_mlir_logical(arg), 1, opts, state)
   end
 
-  defp to_operator(:any?, [arg, opts], _ans, state) do
-    to_aggregate(:any?, {:pred, 8}, {}, arg, 0, opts, state, binary_op_fun(:bitwise_or))
+  defp to_operator(:any, [arg, opts], %{shape: shape}, %{builder: %Function{}} = state) do
+    to_aggregate(:bitwise_or, {:u, 8}, shape, to_mlir_logical(arg), 0, opts, state)
+  end
+
+  defp to_operator(:all, [arg, opts], %{shape: shape}, state) do
+    to_aggregate(:bitwise_and, {:pred, 8}, shape, arg, 1, opts, state)
+  end
+
+  defp to_operator(:any, [arg, opts], %{shape: shape}, state) do
+    to_aggregate(:bitwise_or, {:pred, 8}, shape, arg, 0, opts, state)
   end
 
   defp to_operator(:sum, [arg, opts], %{type: type, shape: shape}, state) do
-    to_aggregate(:sum, type, shape, arg, 0, opts, state, binary_op_fun(:add))
+    to_aggregate(:add, type, shape, arg, 0, opts, state)
   end
 
   defp to_operator(:product, [arg, opts], %{type: type, shape: shape}, state) do
-    to_aggregate(:product, type, shape, arg, 1, opts, state, binary_op_fun(:multiply))
+    to_aggregate(:multiply, type, shape, arg, 1, opts, state)
   end
 
   defp to_operator(:reduce_max, [arg, opts], %{type: type, shape: shape}, state) do
-    min_value = EXLA.Lib.min_value(state.builder, type)
-    to_aggregate(:reduce_max, type, shape, arg, min_value, opts, state, binary_op_fun(:max))
+    min_number = EXLA.Lib.min_number(state.builder, type)
+    to_aggregate(:max, type, shape, arg, min_number, opts, state)
   end
 
   defp to_operator(:reduce_min, [arg, opts], %{type: type, shape: shape}, state) do
-    max_value = EXLA.Lib.max_value(state.builder, type)
-    to_aggregate(:reduce_max, type, shape, arg, max_value, opts, state, binary_op_fun(:min))
+    max_number = EXLA.Lib.max_number(state.builder, type)
+    to_aggregate(:min, type, shape, arg, max_number, opts, state)
   end
 
-  defp to_operator(:reduce, [arg, acc, opts, fun], %{type: type, shape: shape}, state) do
+  defp to_operator(
+         :reduce,
+         [%Value{} = arg, %Value{} = acc, opts, fun],
+         %{type: type, shape: shape},
+         _state
+       ) do
     arg = to_type(arg, type)
-    comp = recur_computation(fun, type, state)
     keep_axes = opts[:keep_axes]
-    result = EXLA.Op.reduce(arg, to_type(acc, type), comp, reduce_axes(arg, opts[:axes]))
+    reduce_axes = reduce_axes(arg, opts[:axes])
+
+    typespec = Typespec.tensor(type, remove_axes(op_shape(arg), reduce_axes))
+    [result] = Value.reduce(fun, [to_type(acc, type)], [arg], reduce_axes, [typespec])
 
     if keep_axes do
-      EXLA.Op.reshape(result, shape)
+      Value.reshape(result, Typespec.tensor(type, shape))
     else
       result
     end
   end
 
-  defp to_operator(:window_sum, [arg, window_dims, opts], %{type: type}, state) do
-    to_window_aggregate(:window_sum, type, arg, 0, window_dims, opts, state, binary_op_fun(:add))
+  defp to_operator(:window_sum, [arg, window_dims, opts], ans, state) do
+    to_window_aggregate(:add, ans, arg, 0, window_dims, opts, state)
   end
 
-  defp to_operator(:window_max, [arg, window_dims, opts], %{type: type}, state) do
-    min_value = EXLA.Lib.min_value(state.builder, type)
-    fun = binary_op_fun(:max)
-    to_window_aggregate(:window_max, type, arg, min_value, window_dims, opts, state, fun)
+  defp to_operator(:window_max, [arg, window_dims, opts], %{type: type} = ans, state) do
+    min_number = EXLA.Lib.min_number(state.builder, type)
+    to_window_aggregate(:max, ans, arg, min_number, window_dims, opts, state)
   end
 
-  defp to_operator(:window_min, [arg, window_dims, opts], %{type: type}, state) do
-    max_value = EXLA.Lib.max_value(state.builder, type)
-    fun = binary_op_fun(:min)
-    to_window_aggregate(:window_min, type, arg, max_value, window_dims, opts, state, fun)
+  defp to_operator(:window_min, [arg, window_dims, opts], %{type: type} = ans, state) do
+    max_number = EXLA.Lib.max_number(state.builder, type)
+    to_window_aggregate(:min, ans, arg, max_number, window_dims, opts, state)
   end
 
-  defp to_operator(:window_product, [arg, window_dims, opts], %{type: type}, state) do
-    fun = binary_op_fun(:multiply)
-    to_window_aggregate(:window_product, type, arg, 1, window_dims, opts, state, fun)
+  defp to_operator(:window_product, [arg, window_dims, opts], ans, state) do
+    to_window_aggregate(:multiply, ans, arg, 1, window_dims, opts, state)
   end
 
   defp to_operator(
-         :reduce_window,
+         :window_reduce,
          [arg, acc, window_dimensions, opts, fun],
-         %{type: type},
-         state
+         %{type: type} = ans,
+         %{builder: %Function{}}
        ) do
     padding_config = opts[:padding]
     strides = opts[:strides]
     window_dilations = opts[:window_dilations]
-
     arg = to_type(arg, type)
-    comp = recur_computation(fun, type, state)
+    acc = to_type(acc, type)
 
-    EXLA.Op.reduce_window(
-      arg,
-      to_type(acc, type),
-      comp,
-      window_dimensions,
-      strides,
-      window_dilations,
-      padding_config
-    )
+    [result] =
+      Value.window_reduce(
+        fun,
+        [acc],
+        [arg],
+        Tuple.to_list(window_dimensions),
+        strides,
+        List.duplicate(1, tuple_size(op_shape(arg))),
+        window_dilations,
+        padding_config,
+        [expr_to_typespec(ans)]
+      )
+
+    result
   end
 
   defp to_operator(
-         :scatter_window_max,
-         [arg, source, window_dimensions, opts, init_value],
-         %{type: type},
-         state
+         :window_scatter_max,
+         [%Value{} = arg, %Value{} = source, %Value{} = init_value, window_dimensions, opts],
+         %{type: type} = ans,
+         _state
        ) do
     padding_config = opts[:padding]
     strides = opts[:strides]
@@ -591,28 +1514,23 @@ defmodule EXLA.Defn do
     source = to_type(source, type)
     init_value = to_type(init_value, type)
 
-    args = [%{type: type, shape: {}}, %{type: type, shape: {}}]
-
-    select_fn = to_computation(:scatter_window_max_select, args, state, binary_op_fun(:greater))
-    scatter_fn = to_computation(:scatter_window_max_scatter, args, state, binary_op_fun(:add))
-
-    EXLA.Op.select_and_scatter(
+    Value.select_and_scatter(
       arg,
-      select_fn,
-      window_dimensions,
-      strides,
-      padding_config,
       source,
       init_value,
-      scatter_fn
+      :gt,
+      Tuple.to_list(window_dimensions),
+      strides,
+      padding_config,
+      expr_to_typespec(ans)
     )
   end
 
   defp to_operator(
-         :scatter_window_min,
-         [arg, source, window_dimensions, opts, init_value],
-         %{type: type},
-         state
+         :window_scatter_min,
+         [%Value{} = arg, %Value{} = source, %Value{} = init_value, window_dimensions, opts],
+         %{type: type} = ans,
+         _state
        ) do
     padding_config = opts[:padding]
     strides = opts[:strides]
@@ -621,469 +1539,795 @@ defmodule EXLA.Defn do
     source = to_type(source, type)
     init_value = to_type(init_value, type)
 
-    args = [%{type: type, shape: {}}, %{type: type, shape: {}}]
-
-    select_fn = to_computation(:scatter_window_min_select, args, state, binary_op_fun(:less))
-    scatter_fn = to_computation(:scatter_window_min_scatter, args, state, binary_op_fun(:add))
-
-    EXLA.Op.select_and_scatter(
+    Value.select_and_scatter(
       arg,
-      select_fn,
-      window_dimensions,
-      strides,
-      padding_config,
       source,
       init_value,
-      scatter_fn
+      :lt,
+      Tuple.to_list(window_dimensions),
+      strides,
+      padding_config,
+      expr_to_typespec(ans)
     )
   end
 
-  defp to_operator(
-         :scatter_add,
-         [target, indices, updates],
-         %{type: type},
-         state
-       ) do
-    target = to_type(target, type)
-    updates = to_type(updates, type)
-
-    args = [%{type: type, shape: {}}, %{type: type, shape: {}}]
-    scatter_fn = to_computation(:scatter_add_addition, args, state, binary_op_fun(:add))
-
-    rank = target |> op_shape() |> tuple_size()
-    # indices_rank is guaranteed to be 2 by Nx.Shape
-    indices_rank = 2
-    rank_diff = rank - indices_rank + 1
-
-    indices_shape = op_shape(indices)
-
-    indices_shape =
-      [List.duplicate(1, rank_diff) | Tuple.to_list(indices_shape)]
-      |> List.flatten()
-      |> List.to_tuple()
-
-    indices = EXLA.Op.reshape(indices, indices_shape)
-
-    # If indices has shape {x, y}, updates is guaranteed by Nx.Shape to
-    # have shape {x}, so if we reshaped indices to {..., x, y}, we need to
-    # reshape updates to {..., x}
-
-    updates_shape = Tuple.delete_at(indices_shape, tuple_size(indices_shape) - 1)
-
-    updates = EXLA.Op.reshape(updates, updates_shape)
-
-    axes = axes_for_rank(rank)
-
-    EXLA.Op.scatter(
-      target,
-      indices,
-      updates,
-      scatter_fn,
-      rank,
-      [],
-      axes,
-      axes
-    )
+  defp to_operator(:indexed_add, [%Value{} | _] = tensors, out, _state) do
+    mlir_scatter(tensors, out, :add)
   end
 
-  defp to_operator(:map, [arg, _opts, fun], %{shape: shape, type: type}, state) do
-    arg = to_type(arg, type)
-    comp = recur_computation(fun, type, state)
-    EXLA.Op.map(arg, comp, Nx.axes(shape))
+  defp to_operator(:indexed_put, [%Value{} | _] = tensors, out, _state) do
+    mlir_scatter(tensors, out, :put)
   end
 
-  @reduction_op [:argmax, :argmin, :reduce_max, :reduce_min]
-
-  defp to_operator(op, [arg, opts], ans, state)
-       when op in @reduction_op do
-    apply(EXLA.Lib, op, [state.builder, arg, [type: ans.type] ++ opts])
+  defp to_operator(op, [arg, opts], ans, state) when op in [:argmax, :argmin] do
+    apply(EXLA.Lib, op, [state.builder, arg, ans.type, opts])
   end
 
-  defp to_operator(:clip, [operand, min, max], ans, _state) do
+  defp to_operator(:clip, [%Value{} = operand, %Value{} = min, %Value{} = max], ans, _state) do
     min = to_type(min, ans.type)
     max = to_type(max, ans.type)
     operand = to_type(operand, ans.type)
 
-    EXLA.Op.clamp(operand, min, max)
+    Value.clamp(operand, min, max, expr_to_typespec(ans))
   end
 
-  defp to_operator(:slice, [tensor, start_indices, lengths, strides], ans, _state) do
+  defp to_operator(:slice, [%Value{} = tensor, start_indices, lengths, strides], ans, _state) do
     all_static? = Enum.all?(start_indices, &is_integer/1)
 
     if all_static? do
       limit_indices = Enum.zip_with(start_indices, lengths, fn i, len -> i + len end)
-      EXLA.Op.slice(tensor, start_indices, limit_indices, strides)
+      Value.slice(tensor, start_indices, limit_indices, strides, expr_to_typespec(ans))
     else
+      sample = Enum.find(start_indices, &(not is_integer(&1)))
+
+      type =
+        Enum.reduce(start_indices, op_type(sample), fn
+          index, acc when is_integer(index) -> acc
+          value, acc -> merge_type(op_type(value), acc)
+        end)
+
+      start_indices = Enum.map(start_indices, &to_type(&1, type))
       zeros = List.duplicate(0, tuple_size(ans.shape))
-      slice = EXLA.Op.dynamic_slice(tensor, start_indices, lengths)
-      EXLA.Op.slice(slice, zeros, lengths, strides)
+
+      typespec = Typespec.tensor(ans.type, List.to_tuple(lengths))
+      slice = Value.dynamic_slice(tensor, start_indices, lengths, typespec)
+
+      if Enum.all?(strides, &(&1 == 1)) do
+        slice
+      else
+        Value.slice(slice, zeros, lengths, strides, expr_to_typespec(ans))
+      end
     end
   end
 
-  defp to_operator(:put_slice, [tensor, start_indices, slice], ans, _state) do
+  defp to_operator(:put_slice, [%Value{} = tensor, start_indices, slice], ans, _state) do
     tensor = to_type(tensor, ans.type)
     slice = to_type(slice, ans.type)
-    EXLA.Op.dynamic_update_slice(tensor, slice, start_indices)
+    Value.dynamic_update_slice(tensor, slice, start_indices, expr_to_typespec(ans))
   end
 
-  defp to_operator(:take, [tensor, indices, axis], _ans, _state) do
-    tensor_rank = tensor |> op_shape() |> tuple_size()
-    indices_rank = indices |> op_shape() |> tuple_size()
-    result_rank = tensor_rank - 1 + indices_rank
-
-    index_vector_dim = indices_rank
-    slice_sizes = tensor |> op_shape() |> put_elem(axis, 1) |> Tuple.to_list()
-    offset_dims = result_rank |> axes_for_rank() |> delete_slice(axis, indices_rank)
-    collapsed_slice_dims = [axis]
-    start_index_map = [axis]
-
-    EXLA.Op.gather(
-      tensor,
-      indices,
-      index_vector_dim,
-      slice_sizes,
-      offset_dims,
-      collapsed_slice_dims,
-      start_index_map
-    )
-  end
-
-  defp to_operator(:take_along_axis, [tensor, indices, axis], _ans, state) do
-    indices_shape = op_shape(indices)
-    indices_rank = tuple_size(indices_shape)
-
-    axes_range = 0..(indices_rank - 1)//1
-
-    index_vector_dim = indices_rank
-    slice_sizes = List.duplicate(1, indices_rank)
-    offset_dims = []
-    collapsed_slice_dims = Enum.to_list(axes_range)
-    start_index_map = Enum.to_list(axes_range)
-
-    indices_exla_shape = EXLA.Op.get_shape(indices)
-
-    iotas =
-      Enum.map(axes_range, fn axis ->
-        EXLA.Op.iota(state.builder, indices_exla_shape, axis)
-      end)
-
-    new_axis_shape = Tuple.append(indices_shape, 1)
-
-    indices =
-      iotas
-      |> List.replace_at(axis, indices)
-      |> Enum.map(&EXLA.Op.reshape(&1, new_axis_shape))
-      |> EXLA.Op.concatenate(indices_rank)
-
-    EXLA.Op.gather(
-      tensor,
-      indices,
-      index_vector_dim,
-      slice_sizes,
-      offset_dims,
-      collapsed_slice_dims,
-      start_index_map
-    )
-  end
-
-  defp to_operator(:gather, [tensor, indices], _ans, _state) do
-    tensor_rank = tensor |> op_shape() |> tuple_size()
-    indices_rank = indices |> op_shape() |> tuple_size()
-
+  defp to_operator(:gather, [%Value{} = tensor, indices, opts], ans, _state) do
+    axes = Keyword.fetch!(opts, :axes)
+    tensor_shape = op_shape(tensor)
+    tensor_rank = tuple_size(tensor_shape)
+    tensor_axes = axes_for_rank(tensor_rank)
+    indices_rank = tuple_size(op_shape(indices))
     index_vector_dim = indices_rank - 1
-    slice_sizes = List.duplicate(1, tensor_rank)
-    offset_dims = []
-    collapsed_slice_dims = axes_for_rank(tensor_rank)
-    start_index_map = axes_for_rank(tensor_rank)
 
-    EXLA.Op.gather(
-      tensor,
-      indices,
-      index_vector_dim,
-      slice_sizes,
-      offset_dims,
-      collapsed_slice_dims,
-      start_index_map
-    )
-  end
-
-  defp to_operator(:reverse, [tensor, axes], _ans, _state) do
-    EXLA.Op.reverse(tensor, axes)
-  end
-
-  defp to_operator(:concatenate, [tensors, axis], ans, _state) do
-    tensors =
-      tensors
-      |> Enum.map(&to_type(&1, ans.type))
-
-    EXLA.Op.concatenate(tensors, axis)
-  end
-
-  defp to_operator(:cholesky, [tensor], ans, state) do
-    tensor = to_type(tensor, ans.type)
-    cholesky = EXLA.Op.cholesky(tensor)
-
-    zeros =
-      state.builder
-      |> to_constant(0.0, ans.type)
-      |> EXLA.Op.broadcast_in_dim(ans.shape, broadcast_axes({}, ans.shape))
-
-    iota_shape = EXLA.Shape.make_shape({:s, 64}, ans.shape)
-    iota_one = EXLA.Op.iota(state.builder, iota_shape, 1)
-    iota_zero = EXLA.Op.iota(state.builder, iota_shape, 0)
-
-    EXLA.Op.select(EXLA.Op.less_equal(iota_one, iota_zero), cholesky, zeros)
-  end
-
-  defp to_operator(:sort, [tensor, opts], ans, state) do
-    dimension = opts[:axis]
-
-    fun =
-      case opts[:direction] do
-        :asc -> binary_op_fun(:less)
-        :desc -> binary_op_fun(:greater)
+    slice_sizes =
+      for i <- tensor_axes do
+        if i in axes, do: 1, else: elem(tensor_shape, i)
       end
 
-    args = [%{type: ans.type, shape: {}}, %{type: ans.type, shape: {}}]
-    comp = to_computation(:comparator, args, state, fun)
+    batch_size = tensor_rank - length(axes)
+    offset_dims = count_up(batch_size, index_vector_dim)
 
-    EXLA.Op.sort(tensor, comp, dimension)
+    Value.gather(
+      tensor,
+      indices,
+      index_vector_dim,
+      slice_sizes,
+      offset_dims,
+      axes,
+      axes,
+      expr_to_typespec(ans)
+    )
+  end
+
+  defp to_operator(:reverse, [%Value{} = tensor, axes], ans, _state) do
+    Value.reverse(tensor, axes, expr_to_typespec(ans))
+  end
+
+  defp to_operator(:concatenate, [[%Value{} | _rest] = tensors, axis], ans, _state) do
+    tensors = Enum.map(tensors, &to_type(&1, ans.type))
+    Value.concatenate(tensors, axis, expr_to_typespec(ans))
+  end
+
+  defp to_operator(:stack, [[%Value{} | _rest] = tensors, axis], ans, _state) do
+    reshape_typespec = Typespec.tensor(ans.type, put_elem(ans.shape, axis, 1))
+    tensors = Enum.map(tensors, &(&1 |> to_type(ans.type) |> Value.reshape(reshape_typespec)))
+    Value.concatenate(tensors, axis, expr_to_typespec(ans))
+  end
+
+  defp to_operator(:sort, [%Value{} = tensor, opts], ans, state) do
+    dimension = opts[:axis]
+
+    op =
+      case opts[:direction] do
+        :asc -> :less
+        :desc -> :greater
+      end
+
+    arg_typespec = Typespec.tensor(ans.type, {})
+    arg_typespecs = [arg_typespec, arg_typespec]
+
+    comp = sort_computation(op, ans.type, arg_typespecs, state)
+
+    Value.sort([tensor], comp, dimension, opts[:stable] == true, [expr_to_typespec(ans)]) |> hd()
   end
 
   defp to_operator(:argsort, [tensor, opts], ans, state) do
     dimension = opts[:axis]
+    stable = opts[:stable] == true
 
-    fun =
+    op =
       case opts[:direction] do
-        :asc -> binary_op_fun(:less)
-        :desc -> binary_op_fun(:greater)
+        :asc -> :less
+        :desc -> :greater
       end
 
-    args = [
-      %{type: op_type(tensor), shape: {}},
-      %{type: op_type(tensor), shape: {}},
-      %{type: ans.type, shape: {}},
-      %{type: ans.type, shape: {}}
-    ]
+    type = op_type(tensor)
 
-    comp = to_computation(:comparator, args, state, fun)
-    EXLA.Lib.argsort(state.builder, tensor, dimension, comp, ans.type)
+    value_typespec = Typespec.tensor(type, {})
+    idx_typespec = Typespec.tensor(ans.type, {})
+    arg_typespecs = [value_typespec, value_typespec, idx_typespec, idx_typespec]
+
+    comp = sort_computation(op, type, arg_typespecs, state)
+
+    EXLA.Lib.argsort(state.builder, tensor, dimension, stable, comp, ans.type)
+  end
+
+  defp fft(exla_op, input_type, output_type, pad_n \\ nil, [%Value{} = tensor, opts], ans) do
+    fft_n = opts[:length]
+    pad_n = pad_n || fft_n
+    axis = opts[:axis]
+    tensor = to_type(tensor, input_type)
+
+    shape = op_shape(tensor)
+    m = elem(shape, axis)
+
+    tensor = fft_pad_or_slice(tensor, m, pad_n, axis, shape, input_type)
+
+    last_axis = tuple_size(shape) - 1
+
+    if axis != last_axis do
+      permutation =
+        Enum.map(0..last_axis, fn
+          ^axis -> last_axis
+          ^last_axis -> axis
+          ax -> ax
+        end)
+
+      padded_shape = op_shape(tensor)
+
+      {transposed_input_shape, _} =
+        Nx.Shape.transpose(
+          padded_shape,
+          permutation,
+          List.duplicate(nil, tuple_size(padded_shape))
+        )
+
+      transposed_input_typespec = Typespec.tensor(input_type, transposed_input_shape)
+
+      {transposed_output_shape, _} = Nx.Shape.transpose(ans.shape, permutation, ans.names)
+      transposed_output_typespec = Typespec.tensor(output_type, transposed_output_shape)
+
+      tensor
+      |> Value.transpose(permutation, transposed_input_typespec)
+      |> exla_op.([fft_n], transposed_output_typespec)
+      |> Value.transpose(permutation, expr_to_typespec(ans))
+    else
+      exla_op.(tensor, [fft_n], expr_to_typespec(ans))
+    end
+  end
+
+  defp fft2(exla_op, [%Value{} = tensor, opts], %{type: type} = ans) do
+    [l1, l2] = lengths = opts[:lengths]
+    [ax1, ax2] = axes = opts[:axes]
+    output_type = Nx.Type.to_complex(type)
+    tensor = to_type(tensor, output_type)
+
+    shape = op_shape(tensor)
+    m1 = elem(shape, ax1)
+    m2 = elem(shape, ax2)
+
+    tensor = fft_pad_or_slice(tensor, m1, l1, ax1, shape, output_type)
+    tensor = fft_pad_or_slice(tensor, m2, l2, ax2, op_shape(tensor), output_type)
+
+    last_axis = tuple_size(shape) - 1
+    penultimate_axis = last_axis - 1
+    last_axes = [penultimate_axis, last_axis]
+
+    if axes != last_axes do
+      permutation =
+        Enum.map(0..last_axis, fn
+          ^ax1 -> penultimate_axis
+          ^penultimate_axis -> ax1
+          ^ax2 -> last_axis
+          ^last_axis -> ax2
+          ax -> ax
+        end)
+
+      {transposed_shape, _} = Nx.Shape.transpose(ans.shape, permutation, ans.names)
+      transposed_typespec = Typespec.tensor(ans.type, transposed_shape)
+
+      tensor
+      |> Value.transpose(permutation, transposed_typespec)
+      |> exla_op.(lengths, transposed_typespec)
+      |> Value.transpose(permutation, expr_to_typespec(ans))
+    else
+      exla_op.(tensor, lengths, expr_to_typespec(ans))
+    end
+  end
+
+  defp fft_pad_or_slice(%Value{function: builder} = tensor, m, n, axis, shape, output_type) do
+    cond do
+      m == n ->
+        tensor
+
+      m > n ->
+        lengths =
+          shape
+          |> Tuple.insert_at(axis + 1, n)
+          |> Tuple.delete_at(axis)
+          |> Tuple.to_list()
+
+        starts = List.duplicate(0, tuple_size(shape))
+        strides = List.duplicate(1, tuple_size(shape))
+
+        limit_indices = Enum.zip_with(starts, lengths, fn i, len -> i + len end)
+
+        {_, shape} = Nx.Shape.slice(shape, starts, limit_indices, strides)
+        typespec = Typespec.tensor(output_type, shape)
+        Value.slice(tensor, starts, limit_indices, strides, typespec)
+
+      m < n ->
+        zero_value = if Nx.Type.complex?(output_type), do: Complex.new(0), else: 0
+
+        zero =
+          Value.constant(builder, [zero_value], Typespec.tensor(output_type, {}))
+
+        padding_config =
+          {0, 0, 0}
+          |> List.duplicate(tuple_size(shape))
+          |> List.replace_at(axis, {0, n - m, 0})
+
+        shape = Nx.Shape.pad(shape, padding_config)
+        typespec = Typespec.tensor(output_type, shape)
+        Value.pad(tensor, zero, padding_config, typespec)
+    end
+  end
+
+  defp mlir_scatter([target, indices, updates, opts], %{type: type} = ans, kind)
+       when kind in [:add, :put] do
+    target = to_type(target, type)
+    updates = to_type(updates, type)
+    update_rank = updates |> op_shape() |> tuple_size()
+    update_axes = tl(axes_for_rank(update_rank))
+    index_axes = Keyword.fetch!(opts, :axes)
+
+    Value.scatter(
+      target,
+      indices,
+      updates,
+      kind,
+      1,
+      update_axes,
+      index_axes,
+      index_axes,
+      expr_to_typespec(ans)
+    )
+  end
+
+  ## Cache and io_call helpers
+
+  defp no_token_cache(),
+    do: %{__MODULE__ => Outfeed.empty()}
+
+  defp new_cache(outfeed),
+    do: %{__MODULE__ => outfeed}
+
+  defp merge_outfeed(%{__MODULE__ => outfeed} = cache, %{__MODULE__ => new_outfeed}),
+    do: %{cache | __MODULE__ => Outfeed.with_token(new_outfeed, outfeed.token)}
+
+  defp reset_token(%{__MODULE__ => outfeed}, token),
+    do: %{__MODULE__ => Outfeed.with_token(outfeed, token)}
+
+  defp update_token(%{__MODULE__ => outfeed} = cache, token),
+    do: %{cache | __MODULE__ => Outfeed.with_token(outfeed, token)}
+
+  defp get_token(%{__MODULE__ => outfeed}), do: outfeed.token
+
+  # The output of the last io_call lowered in the current region. Regions
+  # start from a fresh cache, so it never leaks into another function.
+  defp order_after_last_io_call(operands, cache) do
+    case cache do
+      %{{__MODULE__, :last_io_call} => %Value{} = last} ->
+        [_last | operands] = Value.optimization_barrier([last | operands])
+        operands
+
+      %{} ->
+        operands
+    end
+  end
+
+  defp put_last_io_call(cache, [%Value{} = output | _]),
+    do: Map.put(cache, {__MODULE__, :last_io_call}, output)
+
+  defp put_last_io_call(cache, _outputs), do: cache
+
+  # Lowers the io_calls of a region in the order they were defined, so that
+  # each one can wait for the previous one. Nested scopes lower their own.
+  defp lower_io_calls_in_order(expr, state, cache) do
+    {_seen, io_calls} = Composite.reduce(expr, {%{}, []}, &collect_io_calls/2)
+
+    io_calls
+    |> Enum.sort_by(fn %T{data: %Expr{args: [_, _, _, order]}} -> order end)
+    |> Enum.reduce(cache, fn io_call, cache ->
+      {_, cache} = recur_operator(io_call, state, cache)
+      cache
+    end)
+  end
+
+  # A cond runs only one branch, so its io_calls must stay inside the branch
+  defp collect_io_calls(%T{data: %Expr{id: id, op: :cond}}, {seen, io_calls}),
+    do: {Map.put(seen, id, true), io_calls}
+
+  defp collect_io_calls(%T{data: %Expr{id: id, op: op}} = t, {seen, io_calls}) do
+    if is_map_key(seen, id) do
+      {seen, io_calls}
+    else
+      acc = {Map.put(seen, id, true), if(op == :io_call, do: [t | io_calls], else: io_calls)}
+      {_, acc} = Tree.apply_args(t, :scope, acc, &{&1, collect_io_calls(&1, &2)})
+      acc
+    end
+  end
+
+  defp get_outfeed(%{__MODULE__ => value}), do: value
+
+  defp put_outfeed(cache, outfeed), do: %{cache | __MODULE__ => outfeed}
+
+  defp add_callback(cache, callback) do
+    cache
+    |> get_outfeed()
+    |> Outfeed.add_callback(callback)
+    |> then(&put_outfeed(cache, &1))
   end
 
   ## Computation helpers
 
-  defp recur_computation(name, args, expr, type, state) do
-    to_computation(name, args, state, fn state ->
-      expr
-      |> recur_composite(state, %{})
-      |> elem(0)
-      |> to_type(type)
-    end)
+  defp sort_computation(operator, type, arg_typespecs, %{
+         builder: %EXLA.MLIR.Function{} = function
+       }) do
+    {region, [lhs, rhs | _]} = Function.push_region(function, arg_typespecs)
+
+    typespec = Typespec.tensor({:pred, 8}, {})
+
+    {lhs, rhs} =
+      if Nx.Type.integer?(type) do
+        {lhs, rhs}
+      else
+        {sort_computation_canonicalize_float(lhs), sort_computation_canonicalize_float(rhs)}
+      end
+
+    op = apply(Value, operator, [lhs, rhs, typespec, [total_order: true]])
+
+    Value.return(function, [op])
+    Function.pop_region(function)
+    region
   end
 
-  defp recur_computation(%T{data: %Expr{op: :fun, args: args}}, type, state) do
-    [args, expr, {_, name, _}] = args
-    recur_computation(name, args, expr, type, state)
+  defp sort_computation_canonicalize_float(%Value{function: func} = op) do
+    # Standardize the representation of NaNs (-NaN, NaN) and zeros (-0, 0).
+    # See https://github.com/google/jax/blob/e81c82605f0e1813080cfe1037d043b27b38291d/jax/_src/lax/lax.py#L4248-L4253
+
+    op_typespec = Value.get_typespec(op)
+
+    zero = Value.constant(func, [0], Typespec.to_shape(op_typespec, {}))
+    zeros = Value.constant(func, [0], op_typespec)
+    nans = Value.constant(func, [:nan], op_typespec)
+
+    pred_typespec = Typespec.tensor({:pred, 8}, {})
+    op = Value.select(Value.equal(op, zero, pred_typespec), zeros, op, op_typespec)
+    Value.select(Value.is_nan(op, pred_typespec), nans, op, op_typespec)
   end
 
-  defp to_computation(name, args, state, fun) do
-    subbuilder = subbuilder(state.builder, Atom.to_string(name))
-
-    arg_params =
-      Enum.with_index(args, fn arg, i ->
-        fun_shape = computation_arg_shape(arg)
-        {arg, EXLA.Op.parameter(subbuilder, i, fun_shape, "p#{i}")}
-      end)
-
-    {_, params} = Enum.reduce(arg_params, {0, []}, &computation_arg_param(&1, &2))
-    state = %{state | builder: subbuilder, params: Map.new(params)}
-    EXLA.Builder.build(fun.(state))
+  defp op_computation(
+         op,
+         arg_typespecs,
+         %{builder: %EXLA.MLIR.Function{} = builder},
+         prepare_args
+       ) do
+    {region, args} = Function.push_region(builder, arg_typespecs)
+    op = apply(Value, op, prepare_args.(args) ++ [hd(arg_typespecs)])
+    Value.return(builder, [op])
+    Function.pop_region(builder)
+    region
   end
 
-  defp computation_arg_shape(%{type: type, shape: shape}) do
-    EXLA.Shape.make_shape(type, shape)
+  defp fun_computation(args, expr, type, %{builder: %Function{} = function} = state) do
+    arg_typespecs =
+      Enum.map(args, fn %{type: type, shape: shape} -> Typespec.tensor(type, shape) end)
+
+    {region, mlir_args} = Function.push_region(function, arg_typespecs)
+
+    arg_params = Enum.zip(args, mlir_args)
+
+    params = Enum.flat_map(arg_params, &computation_arg_param/1)
+
+    state = %{
+      state
+      | builder: function,
+        params: Map.new(params),
+        scope_ids: Tree.scope_ids(expr)
+    }
+
+    {res, _} = recur_composite(expr, state, no_token_cache())
+    Value.return(function, Enum.map(res, &to_type(&1, type)))
+    Function.pop_region(function)
+    region
   end
 
-  defp computation_arg_shape(tuple) when is_tuple(tuple) do
+  defp mlir_while_computation(expr, initial, type, state, cache) do
+    arg_typespecs = Enum.map(List.flatten(initial), &Value.get_typespec/1)
+
+    {region, args} = Function.push_region(state.builder, arg_typespecs)
+
+    outer_token = get_token(cache)
+
+    {inner_token, arg_params} =
+      if outer_token do
+        [arg_token | arg_params] = args
+        {arg_token, arg_params}
+      else
+        {nil, args}
+      end
+
+    params = Enum.with_index(arg_params, &{&2, &1})
+
+    state = %{
+      state
+      | params: Map.new(params),
+        scope_ids: Tree.scope_ids(expr)
+    }
+
+    expr =
+      if type == {:pred, 8} and expr.type == {:u, 8} do
+        %{expr | type: {:pred, 8}}
+      else
+        expr
+      end
+
+    comp_cache = lower_io_calls_in_order(expr, state, reset_token(cache, inner_token))
+    {res, comp_cache} = recur_composite(expr, & &1, state, comp_cache)
+
+    res =
+      if type == :with_token do
+        if outer_token do
+          [get_token(comp_cache) | List.flatten(res)]
+        else
+          List.flatten(res)
+        end
+      else
+        Enum.map(res, &to_type(&1, type))
+      end
+
+    Value.return(state.builder, res)
+    Function.pop_region(state.builder)
+
+    {region, merge_outfeed(cache, comp_cache)}
+  end
+
+  defp block_subfunction_description(%module{} = _) do
+    module
+    |> Atom.to_string()
+    |> String.replace(".", "_")
+  end
+
+  defp block_computation(description, args, expr, %{builder: %Function{}} = state, cache) do
+    %Function{module: module, name: name} = subbuilder(state.builder, description)
+
+    arg_typespecs = Enum.map(args, &Value.get_typespec/1)
+    out_typespecs = container_to_typespecs(expr)
+
+    outer_token = get_token(cache)
+    token_typespec = Typespec.token()
+
+    {arg_typespecs, out_typespecs} =
+      if outer_token do
+        {[token_typespec | arg_typespecs], [token_typespec | out_typespecs]}
+      else
+        {arg_typespecs, out_typespecs}
+      end
+
+    function = EXLA.MLIR.Module.add_function(module, name, arg_typespecs, out_typespecs)
+    args = EXLA.MLIR.Function.get_arguments(function)
+
+    {inner_token, args} =
+      if outer_token do
+        [arg_token | args] = args
+        {arg_token, args}
+      else
+        {nil, args}
+      end
+
+    params = Enum.with_index(args, fn param, i -> {i, param} end)
+
+    state = %{
+      state
+      | builder: function,
+        params: Map.new(params),
+        scope_ids: Tree.scope_ids(expr)
+    }
+
+    comp_cache = lower_io_calls_in_order(expr, state, reset_token(cache, inner_token))
+    {res, comp_cache} = recur_composite(expr, state, comp_cache)
+
+    if outer_token do
+      Value.func_return(function, [get_token(comp_cache) | List.flatten(res)])
+    else
+      Value.func_return(function, List.flatten(res))
+    end
+
+    {function, merge_outfeed(cache, comp_cache)}
+  end
+
+  defp computation_arg_param({tuple, params}) when is_tuple(tuple) and is_list(params) do
     tuple
     |> Tuple.to_list()
-    |> Enum.map(&computation_arg_shape/1)
-    |> EXLA.Shape.make_tuple_shape()
+    |> Enum.zip(params)
+    |> Enum.flat_map(&computation_arg_param/1)
   end
 
-  defp computation_arg_param({%{}, param}, {counter, acc}) do
-    {counter + 1, [{counter, param} | acc]}
+  defp computation_arg_param({%T{data: %Expr{op: :parameter, args: [pos]}}, [param]}) do
+    [{pos, param}]
   end
 
-  defp computation_arg_param({tuple, param}, counter_acc) do
-    tuple
-    |> Tuple.to_list()
-    |> Enum.with_index(fn arg, i -> {arg, EXLA.Op.get_tuple_element(param, i)} end)
-    |> Enum.reduce(counter_acc, &computation_arg_param/2)
+  defp computation_arg_param({%T{data: %Expr{op: :parameter, args: [pos]}}, param}) do
+    [{pos, param}]
   end
 
-  defp recur_composite(tuple, state, cache) when is_tuple(tuple) do
+  defp recur_composite(composite, state, cache) do
+    recur_composite(composite, & &1, state, cache)
+  end
+
+  defp recur_composite(tuple, transform, state, cache) when is_tuple(tuple) do
     list = Tuple.to_list(tuple)
 
-    if expr = full_tuple(list, tuple_size(tuple)) do
-      recur_composite(expr, state, cache)
+    if expr = full_tuple(list) do
+      recur_composite(expr, transform, state, cache)
     else
-      {elements, cache} = Enum.map_reduce(list, cache, &recur_composite(&1, state, &2))
-      {EXLA.Op.tuple(state.builder, elements), cache}
+      Enum.map_reduce(list, cache, &recur_composite(&1, transform, state, &2))
     end
   end
 
-  defp recur_composite(expr, state, cache) do
-    recur_operator(expr, state, cache)
+  defp recur_composite(%Value{} = op, transform, _state, cache) do
+    {[transform.(op)], cache}
+  end
+
+  defp recur_composite(expr, transform, state, cache) do
+    {op, cache} = recur_operator(expr, state, cache)
+
+    result =
+      if is_list(op) do
+        Enum.map(op, transform)
+      else
+        [transform.(op)]
+      end
+
+    {result, cache}
   end
 
   # If each element of the tuple is just a reference to the parent expression,
   # discard the tuple elements and return the parent expression.
-  defp full_tuple(list, size) do
-    with [%T{data: %Expr{op: :elem, args: args}} | rest] <- list,
-         [%T{data: %Expr{id: id}} = expr, 0, ^size] <- args,
-         true <- rest |> Enum.with_index(1) |> Enum.all?(&full_tuple?(&1, id, size)) do
+  defp full_tuple(list) do
+    with [%T{data: %Expr{op: :elem, args: [%T{data: %Expr{id: id} = expr}, 0]}} | _] <- list,
+         true <- full_tuple?(list, 0, id) do
       expr
     else
       _ -> nil
     end
   end
 
-  defp full_tuple?({arg, index}, id, size) do
-    match?(%T{data: %Expr{op: :elem, args: [%T{data: %Expr{id: ^id}}, ^index, ^size]}}, arg)
+  defp full_tuple?([arg | args], index, id) do
+    case arg do
+      %T{data: %Expr{op: :elem, args: [%T{data: %Expr{id: ^id}, shape: shape}, ^index]}} ->
+        if shape == {:tuple, index} do
+          true
+        else
+          full_tuple?(args, index + 1, id)
+        end
+
+      _ ->
+        false
+    end
   end
+
+  # We got until the end without traversing the whole tuple
+  defp full_tuple?([], _index, _id), do: false
 
   ## Aggregation
 
-  defp binary_op_fun(op) do
-    fn %{params: %{0 => arg0, 1 => arg1}} -> apply(EXLA.Op, op, [arg0, arg1]) end
-  end
-
-  defp to_aggregate(name, type, shape, arg, initial, opts, state, fun) do
+  defp to_aggregate(op, type, shape, %Value{} = arg, initial, opts, state) do
     arg = to_type(arg, type)
 
     acc =
       case initial do
-        %EXLA.Op{} = initial ->
+        %Value{} = initial ->
           initial
 
         initial when is_number(initial) ->
-          EXLA.Op.constant_r0(state.builder, initial, type)
+          Value.constant(state.builder, [initial], Typespec.tensor(type, {}))
       end
 
-    args = [%{type: type, shape: {}}, %{type: type, shape: {}}]
-    comp = to_computation(name, args, state, fun)
+    args = [Typespec.tensor(type, {}), Typespec.tensor(type, {})]
+    comp = op_computation(op, args, state, &Enum.reverse/1)
+
     keep_axes = opts[:keep_axes]
-    result = EXLA.Op.reduce(arg, acc, comp, reduce_axes(arg, opts[:axes]))
+    reduce_axes = reduce_axes(arg, opts[:axes])
+
+    typespec = Typespec.tensor(type, remove_axes(op_shape(arg), reduce_axes))
+    [result] = Value.reduce(comp, [acc], [arg], reduce_axes, [typespec])
 
     if keep_axes do
-      EXLA.Op.reshape(result, shape)
+      Value.reshape(result, Typespec.tensor(type, shape))
     else
       result
     end
   end
 
-  defp to_window_aggregate(name, type, arg, initial, window_dimensions, opts, state, fun) do
+  defp to_window_aggregate(op, %{type: type} = ans, arg, initial, window_dimensions, opts, state) do
     arg = to_type(arg, type)
 
     acc =
       case initial do
-        %EXLA.Op{} = initial ->
+        %Value{} = initial ->
           initial
 
         initial when is_number(initial) ->
-          EXLA.Op.constant_r0(state.builder, initial, type)
+          Value.constant(state.builder, [initial], Typespec.tensor(type, {}))
       end
 
-    args = [%{type: type, shape: {}}, %{type: type, shape: {}}]
-    comp = to_computation(name, args, state, fun)
+    args = [Typespec.tensor(type, {}), Typespec.tensor(type, {})]
+    # We reverse the argument order because :nan + :infinity
+    # returns :nan but :infinity + :nan returns :infinity.
+    # So we want to keep the current value as first argument
+    # to preserve such properties.
+    comp = op_computation(op, args, state, &Enum.reverse/1)
 
     strides = opts[:strides]
     padding = opts[:padding]
     window_dilations = opts[:window_dilations]
 
-    EXLA.Op.reduce_window(arg, acc, comp, window_dimensions, strides, window_dilations, padding)
+    [result] =
+      Value.window_reduce(
+        comp,
+        [acc],
+        [arg],
+        Tuple.to_list(window_dimensions),
+        strides,
+        List.duplicate(1, tuple_size(op_shape(arg))),
+        window_dilations,
+        padding,
+        [expr_to_typespec(ans)]
+      )
+
+    result
   end
 
   ## Cond
 
-  defp to_if(pred, on_true, on_false, state, cache) do
-    # Collect all predicate parameters, as those are evaluated
-    # outside of the conditional. All other graphs are evaluated
-    # only if necessary inside the conditional.
-    {_, pred_ids} = collect_ids(pred, %{})
+  defp to_if(pred, on_true, on_false, %{builder: %Function{}} = state, cache) do
+    {pred_op, cache} = recur_operator(pred, state, cache) |> unwrap_single_tensor!()
 
-    {pred_op, cache} = recur_operator(pred, state, cache)
-    pred_op = to_type(pred_op, {:pred, 8})
+    true_ids = Tree.scope_ids(on_true)
+    false_ids = Tree.scope_ids(on_false)
 
-    {true_args, true_comp} = to_if_branch(true, on_true, pred_ids, state, cache)
-    {false_args, false_comp} = to_if_branch(false, on_false, pred_ids, state, cache)
-    {EXLA.Op.conditional(pred_op, true_args, true_comp, false_args, false_comp), cache}
-  end
+    cache = recur_shared_ids(on_true, false_ids, state, cache)
+    cache = recur_shared_ids(on_false, true_ids, state, cache)
 
-  defp collect_ids(%T{data: %Expr{id: id}} = t, ids) do
-    case ids do
-      %{^id => true} -> {t, ids}
-      %{} -> Tree.traverse_args(t, Map.put(ids, id, true), &collect_ids/2)
+    out_typespecs = container_to_typespecs(on_true)
+
+    outer_token = get_token(cache)
+
+    result_typespecs =
+      if outer_token do
+        [Typespec.token() | out_typespecs]
+      else
+        out_typespecs
+      end
+
+    {true_computation, cache} = to_mlir_if_branch(on_true, true_ids, state, cache)
+    {false_computation, cache} = to_mlir_if_branch(on_false, false_ids, state, cache)
+    if_results = Value.if_op(pred_op, true_computation, false_computation, result_typespecs)
+
+    if outer_token do
+      [token | results] = if_results
+      {wrap_tuple_result(results, on_true), update_token(cache, token)}
+    else
+      {wrap_tuple_result(if_results, on_true), cache}
     end
   end
 
-  defp collect_args(%T{data: %Expr{id: id, op: op}} = expr, {cache, ids}, pred_ids) do
-    cond do
-      Map.has_key?(pred_ids, id) or op == :parameter ->
-        case ids do
-          %{^id => {_, _, new}} ->
-            {new, {cache, ids}}
-
-          %{} ->
-            i = map_size(ids)
-            param = Expr.parameter(expr, i)
-            {param, {cache, Map.put(ids, id, {i, expr, param})}}
-        end
-
-      expr = Map.get(cache, id) ->
-        {expr, {cache, ids}}
-
-      true ->
-        {args, {cache, ids}} =
-          Tree.traverse_args(expr, {cache, ids}, &collect_args(&1, &2, pred_ids))
-
-        expr = put_in(expr.data.args, args)
-        {expr, {Map.put(cache, id, expr), ids}}
-    end
-  end
-
-  defp to_if_branch(bool, expr, ids, state, cache) do
-    {expr, {_cache, ids_args}} = Tree.composite(expr, {%{}, %{}}, &collect_args(&1, &2, ids))
-    sorted_ids_args = Enum.sort_by(ids_args, fn {_id, {i, _old, _new}} -> i end)
-    subbuilder = subbuilder(state.builder, "if-#{Atom.to_string(bool)}")
-
-    shapes =
-      for {_, {_, _, %{type: type, shape: shape}}} <- sorted_ids_args do
-        EXLA.Shape.make_shape(type, shape)
-      end
-
-    tuple_shape = EXLA.Shape.make_tuple_shape(shapes)
-    param = EXLA.Op.parameter(subbuilder, 0, tuple_shape, "p")
-
-    params =
-      for {_, {i, _, _}} <- sorted_ids_args do
-        {i, EXLA.Op.get_tuple_element(param, i)}
-      end
-
-    comp =
-      expr
-      |> recur_composite(%{state | builder: subbuilder, params: Map.new(params)}, %{})
-      |> elem(0)
-      |> EXLA.Builder.build()
-
-    args =
-      Enum.map(sorted_ids_args, fn
-        {_, {_, %T{data: %Expr{op: :parameter, args: [i]}}, _}} -> Map.fetch!(state.params, i)
-        {id, {_, _, _}} -> Map.fetch!(cache, id)
+  defp recur_shared_ids(
+         expr,
+         other_ids,
+         %{scope_ids: ids} = state,
+         cache
+       ) do
+    {_, cache} =
+      Composite.reduce(expr, {%{}, cache}, fn node, acc ->
+        do_recur_shared_ids(node, state, acc, {ids, other_ids})
       end)
 
-    {EXLA.Op.tuple(state.builder, args), comp}
+    cache
+  end
+
+  defp shared?(_id, :parameter, _args, _shared_ids),
+    do: true
+
+  # We never pass reference to tuples around, only through their elements,
+  # so if a tuple is in a predicate, then it all must be in a predicate.
+  defp shared?(_id, :elem, [%T{data: %Expr{id: tuple_id}}, _pos], {parent_ids, sibling_ids})
+       when is_map_key(parent_ids, tuple_id) or is_map_key(sibling_ids, tuple_id),
+       do: true
+
+  defp shared?(id, _op, _args, {parent_ids, sibling_ids}),
+    do: is_map_key(parent_ids, id) or is_map_key(sibling_ids, id)
+
+  defp do_recur_shared_ids(
+         %T{data: %Expr{id: id, op: op, args: args}} = expr,
+         state,
+         {visited, cache},
+         shared_ids
+       ) do
+    cond do
+      Map.has_key?(visited, id) ->
+        {visited, cache}
+
+      op == :constant or shared?(id, op, args, shared_ids) ->
+        {_, cache} = recur_operator(expr, state, cache)
+        {Map.put(visited, id, true), cache}
+
+      true ->
+        {_, {visited, cache}} =
+          Tree.apply_args(
+            expr,
+            :scope,
+            {visited, cache},
+            &{&1, do_recur_shared_ids(&1, state, &2, shared_ids)}
+          )
+
+        {Map.put(visited, id, true), cache}
+    end
+  end
+
+  defp to_mlir_if_branch(expr, current_ids, state, cache) do
+    {region, []} = Function.push_region(state.builder, [])
+
+    comp_state = %{state | scope_ids: current_ids}
+
+    {res, res_cache} = recur_composite(expr, & &1, comp_state, cache)
+
+    if token = get_token(cache) do
+      Value.return(state.builder, [token | List.flatten(res)])
+    else
+      Value.return(state.builder, List.flatten(res))
+    end
+
+    Function.pop_region(state.builder)
+
+    {region, merge_outfeed(cache, res_cache)}
   end
 
   ## Axes helpers
@@ -1094,16 +2338,14 @@ defmodule EXLA.Defn do
     max_size = tuple_size(max)
 
     # To reproduce Nx broadcast, we simply match the lower dimensions to the highest ones.
-    List.to_tuple(count_up(min_size, max_size - min_size))
+    count_up(min_size, max_size - min_size)
   end
 
   defp reduce_axes(op, axes) do
     if axes do
-      axes
-      |> Enum.sort()
-      |> List.to_tuple()
+      Enum.sort(axes)
     else
-      List.to_tuple(Nx.axes(op_shape(op)))
+      Nx.axes(op_shape(op))
     end
   end
 
@@ -1118,120 +2360,124 @@ defmodule EXLA.Defn do
 
   ## Op Helpers
 
-  defp op_type(op), do: EXLA.Op.get_shape(op).dtype
-  defp op_shape(op), do: EXLA.Op.get_shape(op).dims
+  defp op_type(%Value{} = op), do: Value.get_typespec(op).type
 
-  defp to_type(op, :any), do: op
+  defp op_shape(%Value{} = op), do: Value.get_typespec(op).shape
 
-  defp to_type(op, type) do
-    if op_type(op) == type, do: op, else: EXLA.Op.convert_element_type(op, type)
+  defp convolution(operand, kernel, opts, state, typespec) do
+    dimension_numbers =
+      {opts[:input_permutation], opts[:kernel_permutation], opts[:output_permutation]}
+
+    Value.convolution(
+      operand,
+      kernel,
+      opts[:strides],
+      opts[:padding],
+      opts[:input_dilation],
+      opts[:kernel_dilation],
+      dimension_numbers,
+      opts[:feature_group_size],
+      opts[:batch_group_size],
+      state.precision,
+      typespec
+    )
+  end
+
+  defp to_type(%Value{} = op, type) do
+    typespec = Value.get_typespec(op)
+
+    if typespec.type == type do
+      op
+    else
+      Value.convert(op, Typespec.to_type(typespec, type))
+    end
   end
 
   defp merge_type({:pred, 8}, {:pred, 8}), do: {:pred, 8}
   defp merge_type(left, right), do: Nx.Type.merge(to_nx_type(left), to_nx_type(right))
 
-  defp to_constant(builder, constant, type) do
-    EXLA.Op.constant_r0(builder, constant, type)
-  end
-
-  defp subbuilder(%EXLA.Builder{name: name} = builder, desc) do
-    suffix = System.unique_integer([:positive])
-    EXLA.Builder.new(builder, name <> "-" <> desc <> "-" <> Integer.to_string(suffix))
-  end
-
-  ## EXLA.Buffer -> Nx
-
-  defp buffer_to_nx(buffers, outputs) do
-    {result, []} = each_buffer_to_nx(outputs, buffers)
-    result
-  end
-
-  defp each_buffer_to_nx({:tuple, outputs}, acc) when is_list(outputs) do
-    {exprs, acc} = Enum.map_reduce(outputs, acc, &each_buffer_to_nx/2)
-    {List.to_tuple(exprs), acc}
-  end
-
-  defp each_buffer_to_nx({:struct, outputs, mod}, acc) when is_list(outputs) do
-    {exprs, acc} =
-      Enum.map_reduce(outputs, acc, fn {k, v}, acc ->
-        {v, acc} = each_buffer_to_nx(v, acc)
-        {{k, v}, acc}
-      end)
-
-    {struct(mod, exprs), acc}
-  end
-
-  defp each_buffer_to_nx({:map, outputs}, acc) when is_list(outputs) do
-    {exprs, acc} =
-      Enum.map_reduce(outputs, acc, fn {k, v}, acc ->
-        {v, acc} = each_buffer_to_nx(v, acc)
-        {{k, v}, acc}
-      end)
-
-    {Map.new(exprs), acc}
-  end
-
-  defp each_buffer_to_nx(hole, [%EXLA.Buffer{shape: shape} = buffer | acc]) do
-    nx_type = to_nx_type(shape.dtype)
-    nx_shape = shape.dims
-
-    if hole.type != nx_type do
-      raise "internal bug! Nx.Defn expected a tensor with type #{inspect(hole.type)} " <>
-              "but got #{inspect(nx_type)}"
-    end
-
-    if hole.shape != nx_shape do
-      raise "internal bug! Nx.Defn expected a tensor with shape #{inspect(hole.shape)} " <>
-              "but got #{inspect(nx_shape)}"
-    end
-
-    {%{hole | data: buffer_to_data(buffer)}, acc}
-  end
-
-  defp buffer_to_data(%EXLA.Buffer{ref: ref, data: nil}),
-    do: %EXLA.DeviceBackend{state: ref}
-
-  defp buffer_to_data(%EXLA.Buffer{ref: nil, data: data}),
-    do: %Nx.BinaryBackend{state: data}
-
   defp to_nx_type({:pred, 8}), do: {:u, 8}
   defp to_nx_type(type), do: type
 
-  ## Nx -> EXLA.Buffer
-
-  defp nx_to_buffer(vars, inputs), do: nx_to_buffer(vars, 0, inputs, [], [])
-
-  defp nx_to_buffer([var | vars], i, [i | inputs], buffers, cache) do
-    i = i + 1
-    nx_to_buffer(vars, i, inputs, [nx_to_buffer!(var) | buffers], [nx_to_cache_key!(var) | cache])
+  defp to_constant(%EXLA.MLIR.Function{} = function, constant, type) do
+    Value.constant(function, [constant], Typespec.tensor(type, {}))
   end
 
-  defp nx_to_buffer([var | vars], i, inputs, buffers, cache) do
-    nx_to_buffer(vars, i + 1, inputs, buffers, [nx_to_cache_key!(var) | cache])
+  defp subbuilder(%EXLA.MLIR.Function{name: name} = function, description) do
+    suffix = System.unique_integer([:positive])
+    %{function | name: name <> "_" <> description <> "_" <> Integer.to_string(suffix)}
   end
-
-  defp nx_to_buffer([], _i, [], buffers, cache) do
-    {Enum.reverse(buffers), cache}
-  end
-
-  defp nx_to_buffer!(%T{data: data, type: type, shape: shape} = tensor) do
-    case data do
-      %EXLA.DeviceBackend{state: ref} ->
-        EXLA.Buffer.buffer(ref, EXLA.Shape.make_shape(type, shape))
-
-      _ ->
-        # TODO: Call Nx.backend_transfer on the tensor instead
-        EXLA.Buffer.buffer(Nx.to_binary(tensor), EXLA.Shape.make_shape(type, shape))
-    end
-  end
-
-  defp nx_to_cache_key!(%T{type: type, shape: shape}), do: {type, shape}
-  defp nx_to_expr_key!(%T{type: type, shape: shape, names: names}), do: {type, shape, names}
 
   # Helpers
 
-  defp delete_slice(enumerable, index, length) do
-    {left, right} = Enum.split(enumerable, index)
-    left ++ Enum.drop(right, length)
+  defp apply_mlir_broadcasted_bin_op(op, out, left, right) do
+    left_typespec = Value.get_typespec(left)
+    right_typespec = Value.get_typespec(right)
+    left_dims = broadcast_axes(left_typespec.shape, out.shape)
+    right_dims = broadcast_axes(right_typespec.shape, out.shape)
+
+    type = merge_type(left_typespec.type, right_typespec.type)
+    type = merge_type(type, out.type)
+
+    left = to_type(left, type)
+
+    left =
+      if left_typespec.shape == out.shape do
+        left
+      else
+        Value.broadcast_in_dim(left, left_dims, Typespec.tensor(type, out.shape))
+      end
+
+    right = to_type(right, type)
+
+    right =
+      if right_typespec.shape == out.shape do
+        right
+      else
+        Value.broadcast_in_dim(right, right_dims, Typespec.tensor(type, out.shape))
+      end
+
+    Value
+    |> apply(op, [left, right, Typespec.tensor(type, out.shape)])
+    |> to_type(out.type)
+  end
+
+  defp to_mlir_logical(%Value{} = value) do
+    to_type(value, {:pred, 8})
+  end
+
+  defp container_to_typespecs(container) do
+    [container]
+    |> Nx.Defn.Composite.flatten_list()
+    |> Enum.flat_map(fn
+      %Nx.Tensor{type: {:tuple, _}, data: %{args: values}} ->
+        Enum.flat_map(values, &container_to_typespecs/1)
+
+      t ->
+        [Typespec.tensor(t.type, t.shape)]
+    end)
+  end
+
+  defp wrap_tuple_result(list, template) when is_tuple(template) do
+    list
+  end
+
+  defp wrap_tuple_result(list, %Nx.Tensor{type: {:tuple, _}}) do
+    list
+  end
+
+  defp wrap_tuple_result([value], _), do: value
+
+  defp unwrap_single_tensor!({[%Value{} = op], cache}), do: {op, cache}
+  defp unwrap_single_tensor!({%Value{} = op, cache}), do: {op, cache}
+
+  defp remove_axes(shape, axes) do
+    axes
+    |> Enum.reverse()
+    |> Enum.reduce(shape, &Tuple.delete_at(&2, &1))
+  end
+
+  defp expr_to_typespec(expr) do
+    Typespec.tensor(expr.type, expr.shape)
   end
 end

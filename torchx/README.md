@@ -1,9 +1,8 @@
 <h1><img src="https://github.com/elixir-nx/nx/raw/main/torchx/torchx.png" alt="Torchx" width="400"></h1>
 
-Elixir client for LibTorch (from PyTorch). It includes a backend for `Nx` for native
-execution of tensor operations (inside and outside of `defn`).
-
-This project is currently alpha and it supports only a fraction of `Nx`'s API.
+Elixir client for PyTorch (through the LibTorch C++ frontend).
+It includes a backend for `Nx` for native execution of tensor
+operations (inside and outside of `defn`).
 
 ## Installation
 
@@ -11,33 +10,55 @@ In order to use `Torchx`, you will need Elixir installed. Then create an Elixir 
 via the `mix` build tool:
 
 ```
-$ mix new my_app
+mix new my_app
 ```
 
-Then you can add `Torchx` as dependency in your `mix.exs`. At the moment you will have to
-use a Git dependency while we work on our first release:
+Then you can add `Torchx` as dependency in your `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:torchx, "~> 0.1.0-dev", github: "elixir-nx/nx", sparse: "torchx"},
-    {:nx, "~> 0.1.0-dev", github: "elixir-nx/nx", sparse: "nx", override: true}
+    {:torchx, "~> 1.0"}
   ]
 end
 ```
 
-We will automatically download a precompiled version of `LibTorch` that runs on the CPU.
-If you want to use another version, [download the .zip file of another `LibTorch` version
-from the official website](https://pytorch.org/get-started/locally/), unpack it to a
-directory of your choice and set the `LIBTORCH_DIR` [environment variable](https://en.wikipedia.org/wiki/Environment_variable)
-to point to the unpacked directory.
+If you are using Livebook or IEx, you can instead run:
 
-Once downloaded, we will compile `Torchx` bindings. You will need `make`, `cmake` (3.12+) and a `C++`
-compiler. If running on Windows, you will need:
+```elixir
+Mix.install([
+  {:torchx, "~> 1.0"}
+])
+```
+
+We will automatically download a precompiled version of `LibTorch` that
+runs on the CPU. If you want to use another version, you can set `LIBTORCH_VERSION`
+to `2.4.0` or later.
+
+If you want torch with CUDA support, please use `LIBTORCH_TARGET` to choose
+CUDA versions. The current supported targets are:
+
+| Torch Version   | Supported Targets                                              |
+| --------------- | -------------------------------------------------------------- |
+| 2.7.0           | cpu, cu118 (CUDA 11.8), cu126 (CUDA 12.6), cu128 (CUDA 12.8)   |
+| 2.8.0           | cpu, cu126 (CUDA 12.6), cu128 (CUDA 12.8), cu129 (CUDA 12.9)   |
+| 2.9.0           | cpu, cu126 (CUDA 12.6), cu128 (CUDA 12.8), cu130 (CUDA 13.0)   |
+
+Once downloaded, we will compile `Torchx` bindings. You will need `make`/`nmake`,
+`cmake` (3.12+) and a `C++` compiler. If building on Windows, you will need:
 
 - [Microsoft Build Tools 2019](https://visualstudio.microsoft.com/downloads/)
 - [Microsoft Visual C++ 2019 Redistributable](https://visualstudio.microsoft.com/downloads/)
 - [CMake](https://cmake.org/)
+
+You can also compile LibTorch from scratch, using the official instructions,
+and configure this library to use it by pointing the `LIBTORCH_DIR` environment
+variable to the LibTorch directory.
+
+On Windows, LibTorch DLLs are normally installed under the app's
+`priv/libtorch` directory. To override the runtime DLL search path, set
+`LIBTORCH_DLL_DIR` (or `config :torchx, :libtorch_dll_dir`) before compiling;
+the path is passed into the DLL loader NIF at load time.
 
 ## Usage
 

@@ -13,6 +13,9 @@ defmodule Nx.Tensor do
     * `:shape` - the tensor shape
     * `:type` - the tensor type
     * `:names` - the tensor names
+    * `:vectorized_axes` - a tuple that encodes names and sizes for vectorization
+    * `:donatable?` - when `true`, supporting compilers may donate this tensor's
+      buffer at the next JIT/compile boundary (see `Nx.donatable/1`)
 
   In general it is discouraged to access those fields directly. Use
   the functions in the `Nx` module instead. Backends have to access those
@@ -25,10 +28,18 @@ defmodule Nx.Tensor do
   @type axis :: name | integer
   @type axes :: [axis]
   @type name :: atom
-  @type t :: %Nx.Tensor{data: data, type: type, shape: shape, names: [name]}
+
+  @type t :: %Nx.Tensor{data: data, type: type, shape: shape, names: [name], donatable?: boolean}
+  @type t(data) :: %Nx.Tensor{
+          data: data,
+          type: type,
+          shape: shape,
+          names: [name],
+          donatable?: boolean
+        }
 
   @enforce_keys [:type, :shape, :names]
-  defstruct [:data, :type, :shape, :names]
+  defstruct [:data, :type, :shape, :names, vectorized_axes: [], donatable?: false]
 
   ## Access
 
@@ -40,8 +51,11 @@ defmodule Nx.Tensor do
           "cannot use the tensor[index] syntax on scalar tensor #{inspect(tensor)}"
   end
 
-  def fetch(tensor, %Nx.Tensor{} = index),
+  def fetch(tensor, %Nx.Tensor{shape: {}} = index),
     do: {:ok, fetch_axes(tensor, [{0, index}])}
+
+  def fetch(tensor, %Nx.Tensor{} = index),
+    do: {:ok, Nx.take(tensor, index)}
 
   def fetch(tensor, index) when is_integer(index),
     do: {:ok, fetch_axes(tensor, [{0, index}])}
@@ -63,9 +77,9 @@ defmodule Nx.Tensor do
     tensor[slice] expects slice to be one of:
 
       * an integer or a scalar tensor representing a zero-based index
-      * a first..last range representing inclusive start-stop indexes
-      * a list of integers and ranges
-      * a keyword list of integers and ranges
+      * a first..last//step range representing inclusive start-stop indexes with an optional positive step
+      * a list of integers, scalar tensors, and ranges
+      * a keyword list of integers, scalar tensors, and ranges
 
     Got #{inspect(value)}
     """
@@ -82,34 +96,78 @@ defmodule Nx.Tensor do
 
   defp fetch_axes(%Nx.Tensor{shape: shape} = tensor, axes) do
     rank = Nx.rank(shape)
-    impl = Nx.Shared.impl!(tensor)
-    {start, lengths, squeeze} = fetch_axes(rank - 1, axes, shape, [], [], [])
 
-    %{tensor | shape: List.to_tuple(lengths)}
-    |> impl.slice(tensor, start, lengths, List.duplicate(1, rank))
+    {start, lengths, squeeze, strides} = fetch_axes(rank - 1, axes, shape, [], [], [], [])
+
+    tensor
+    |> Nx.slice(start, lengths, strides: strides)
     |> Nx.squeeze(axes: squeeze)
   end
 
-  defp fetch_axes(axis, axes, shape, start, lengths, squeeze) when axis >= 0 do
+  defp fetch_axes(axis, axes, shape, start, lengths, squeeze, strides) when axis >= 0 do
     case List.keytake(axes, axis, 0) do
-      {{^axis, %Nx.Tensor{} = index}, axes} ->
-        fetch_axes(axis - 1, axes, shape, [index | start], [1 | lengths], [axis | squeeze])
+      {{^axis, %Nx.Tensor{shape: index_shape} = index}, axes} ->
+        if index_shape != {} do
+          raise ArgumentError,
+                "tensor must be a scalar when accessing a list/keyword of dimensions, " <>
+                  "got: #{inspect(index)}"
+        end
+
+        fetch_axes(
+          axis - 1,
+          axes,
+          shape,
+          [index | start],
+          [1 | lengths],
+          [axis | squeeze],
+          [1 | strides]
+        )
 
       {{^axis, index}, axes} when is_integer(index) ->
         index = normalize_index(index, axis, shape)
-        fetch_axes(axis - 1, axes, shape, [index | start], [1 | lengths], [axis | squeeze])
 
-      {{^axis, first..last//step = range}, axes} ->
-        first = normalize_index(first, axis, shape)
-        last = normalize_index(last, axis, shape)
+        fetch_axes(
+          axis - 1,
+          axes,
+          shape,
+          [index | start],
+          [1 | lengths],
+          [axis | squeeze],
+          [1 | strides]
+        )
 
-        if last < first or step != 1 do
+      {{^axis, first..last_in//step = range}, axes} ->
+        base_range_raise_message = "range step must be positive, got range: #{inspect(range)}"
+
+        if step == -1 do
           raise ArgumentError,
-                "slicing a tensor requires a non-empty range with a step of 1, got: #{inspect(range)}"
+                base_range_raise_message <>
+                  ". Did you mean to pass the range #{inspect(Range.new(first, last_in, 1))} instead?"
+        end
+
+        if step < 0 do
+          raise ArgumentError, base_range_raise_message
+        end
+
+        first = normalize_index(first, axis, shape)
+        last = normalize_index(last_in, axis, shape)
+
+        range = first..last//step
+
+        range_size = Range.size(range)
+
+        if range_size == 0 do
+          raise ArgumentError,
+                "slicing a tensor requires a non-empty range, got: #{inspect(range)}"
         end
 
         len = last - first + 1
-        fetch_axes(axis - 1, axes, shape, [first | start], [len | lengths], squeeze)
+
+        start = [first | start]
+        lengths = [len | lengths]
+        strides = [step | strides]
+
+        fetch_axes(axis - 1, axes, shape, start, lengths, squeeze, strides)
 
       {{^axis, value}, _} ->
         raise ArgumentError,
@@ -117,17 +175,25 @@ defmodule Nx.Tensor do
                 inspect(value)
 
       nil ->
-        fetch_axes(axis - 1, axes, shape, [0 | start], [elem(shape, axis) | lengths], squeeze)
+        fetch_axes(
+          axis - 1,
+          axes,
+          shape,
+          [0 | start],
+          [elem(shape, axis) | lengths],
+          squeeze,
+          [1 | strides]
+        )
     end
   end
 
-  defp fetch_axes(_axis, [{axis, _} | _], shape, _start, _lengths, _squeeze) do
+  defp fetch_axes(_axis, [{axis, _} | _], shape, _start, _lengths, _squeeze, _strides) do
     raise ArgumentError,
           "unknown or duplicate axis #{axis} found when slicing shape #{inspect(shape)}"
   end
 
-  defp fetch_axes(_axis, [], _shape, start, lengths, squeeze) do
-    {start, lengths, squeeze}
+  defp fetch_axes(_axis, [], _shape, start, lengths, squeeze, strides) do
+    {start, lengths, squeeze, strides}
   end
 
   defp normalize_index(index, axis, shape) do
@@ -144,7 +210,7 @@ defmodule Nx.Tensor do
 
   @impl true
   def get_and_update(_tensor, _index, _update) do
-    raise "Access.get_and_update/3 is not yet supported by Nx.Tensor"
+    raise "Access.get_and_update/3 is not supported. Please use Nx.put_slice/3 instead"
   end
 
   @impl true
@@ -155,17 +221,55 @@ defmodule Nx.Tensor do
   defimpl Inspect do
     import Inspect.Algebra
 
-    def inspect(%{shape: shape, names: names, type: type} = tensor, opts) do
+    def inspect(
+          %{shape: shape, names: names, type: type, vectorized_axes: vectorized_axes} = tensor,
+          opts
+        ) do
       open = color("[", :list, opts)
       close = color("]", :list, opts)
       type = color(Nx.Type.to_string(type), :atom, opts)
-      shape = Nx.Shape.to_algebra(shape, names, open, close)
-      data = tensor.data.__struct__.inspect(tensor, opts)
-      inner = concat([line(), type, shape, line(), data])
 
-      color("#Nx.Tensor<", :map, opts)
-      |> concat(nest(inner, 2))
-      |> concat(color("\n>", :map, opts))
+      {vectorized_names, vectorized_sizes} = Enum.unzip(vectorized_axes)
+      vectorized_shape_tuple = List.to_tuple(vectorized_sizes)
+
+      vectorized_shape =
+        if vectorized_axes == [] do
+          empty()
+        else
+          concat([
+            "vectorized",
+            Nx.Shape.to_algebra(vectorized_shape_tuple, vectorized_names, open, close),
+            line()
+          ])
+        end
+
+      shape = Nx.Shape.to_algebra(shape, names, open, close)
+
+      donatable =
+        if tensor.donatable? do
+          " [donatable]"
+        else
+          empty()
+        end
+
+      # Devectorizing helps validate results
+      data = tensor.data.__struct__.inspect(Nx.devectorize(tensor), opts)
+
+      inner =
+        if data == empty() do
+          concat([line(), vectorized_shape, type, shape, donatable, data])
+        else
+          concat([line(), vectorized_shape, type, shape, donatable, line(), data])
+        end
+
+      force_unfit(
+        concat([
+          color("#Nx.Tensor<", :map, opts),
+          nest(inner, 2),
+          line(),
+          color(">", :map, opts)
+        ])
+      )
     end
   end
 end

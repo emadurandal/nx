@@ -1,0 +1,148 @@
+# Changelog
+
+## Unreleased
+
+  * Factor singular matrices in `Nx.LinAlg.lu/2` instead of raising
+
+### Enhancements
+
+  * Reuse the buffer of donatable tensors in elementwise, indexing and view operations instead of copying them
+  * Drop the copy of the batched `Nx.dot/6` result
+  * Broadcast `Nx.eye/2` and `Nx.iota/2` results as views
+
+## v1.0.0 (2026-09-10)
+
+  * Update to latest Nx
+  * Support `Nx.to_pointer/2` and `Nx.from_pointer/5`
+
+## v0.13.1 (2026-08-10)
+
+  * Update to latest Nx to resolve bug (#1804)
+
+## v0.13.0 (2026-07-17)
+
+  * Update to latest Nx
+  * Add backend documentation guides
+  * Fix NIF/`on_load` ordering when loading LibTorch shared libraries
+
+## v0.12.0 (2026-05-15)
+
+  * Update to latest Nx
+  * Add `Nx.rfft/2` and `Nx.irfft/2` support
+  * Add `Nx.block/4` support
+  * Fix `Nx.window_scatter_max/min` crash on f64 tensors
+  * Fix visibility hidden symbols
+
+## v0.11.0 (2026-02-10)
+
+  * Update to latest Nx
+  * Add FP8 E4M3FN support
+  * Fix device handling in window scatter functions
+  * Improve MPS (Apple Silicon) support
+
+## v0.10.2 (2025-10-27)
+
+  * Allow Libtorch version 2.9
+  * Fix Linux installation URL for Torch >= 2.8
+
+## v0.10.1 (2025-10-12)
+
+  * Update Libtorch to version 2.8
+
+## v0.10.0 (2025-06-17)
+
+  * Update Libtorch to version 2.7
+  * Update to latest Nx
+
+## v0.9.2 (2024-11-16)
+
+  * Update to latest Nx
+
+## v0.9.1 (2024-10-08)
+
+  * Update to latest Nx
+
+## v0.9.0 (2024-09-26)
+
+  * Update to latest Nx
+
+## v0.8.0 (2024-08-19)
+
+  * Update to latest Nx
+
+## v0.7.1 (2024-02-27)
+
+  * Update to latest Nx
+
+## v0.7.0 (2024-02-22)
+
+  * Update to latest Nx
+
+## v0.6.4 (2023-11-13)
+
+  * Update to latest Nx
+  * Improve the `:axes` option in `gather`, `indexed_add`, and `indexed_put`
+
+## v0.6.3 (2023-11-09)
+
+  * Update to latest Nx
+
+## v0.6.1 (2023-09-12)
+
+  * Update to latest Nx
+
+## v0.6.0 (2023-08-15)
+
+  * Update to latest Nx
+
+## v0.5.3 (2023-04-14)
+
+  * No changes
+
+## v0.5.2 (2023-03-21)
+
+  * No changes
+
+## v0.5.1 (2023-02-18)
+
+  * Support `top_k`
+
+## v0.5.0 (2023-02-10)
+
+  * Use relative symlinks on compilation whenever possible
+
+## v0.4.2 (2023-01-13)
+
+### Enhancements
+
+  * Cache LibTorch downloads across repositories
+
+## v0.4.1 (2022-12-07)
+
+### Enhancements
+
+  * Require Nx ~> 0.4.1
+
+## v0.4.0 (2022-10-25)
+
+### Enhancements
+
+  * Support `bitcast`
+  * Support window dilations
+  * Support conv input dilations
+  * Support for Apple Silicon
+  * Emulate u16/u32/u64 types
+
+### Bug fixes
+
+  * Fix dot product with multiple batches
+
+## v0.3.0 (2022-08-13)
+
+### Enhancements
+
+  * Support new callbacks added in Nx v0.3.0
+
+## v0.2.0 (2022-04-28)
+
+First release.

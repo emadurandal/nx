@@ -28,6 +28,11 @@ defmodule Nx.Backend do
 
   This module also includes functions that are meant to be shared
   across backends.
+
+  Backends may publish backend documentation guides that mirror the Nx API and
+  describe divergent behaviour, backend-specific options, and limitations — see
+  the [backend documentation convention](backend_documentation-convention.html)
+  guide.
   """
 
   @type t :: %{__struct__: atom()}
@@ -38,23 +43,31 @@ defmodule Nx.Backend do
   @type axes :: Nx.Tensor.axes()
   @type backend_options :: term()
 
-  @callback scalar(out :: tensor, binary, backend_options) :: tensor
+  @callback init(keyword()) :: backend_options
+
+  @callback constant(out :: tensor, number | Complex.t(), backend_options) :: tensor
   @callback from_binary(out :: tensor, binary, backend_options) :: tensor
   @callback eye(tensor, backend_options) :: tensor
   @callback iota(tensor, axis | nil, backend_options) :: tensor
-  @callback random_uniform(tensor, tensor, tensor, backend_options) :: tensor
-  @callback random_normal(tensor, mu :: tensor, sigma :: tensor, backend_options) :: tensor
 
   @callback backend_deallocate(tensor) :: :ok | :already_deallocated
   @callback backend_copy(tensor, module, backend_options) :: tensor
   @callback backend_transfer(tensor, module, backend_options) :: tensor
-  @callback to_batched_list(out :: tensor, tensor, keyword) :: [tensor]
+  @callback to_batched(out :: tensor, tensor, keyword) :: [tensor]
   @callback to_binary(tensor, limit :: non_neg_integer) :: binary
   @callback inspect(tensor, Inspect.Opts.t()) :: tensor
+  @callback from_pointer(
+              opaque_pointer :: term(),
+              type :: tuple(),
+              shape :: tuple(),
+              backend_opts :: keyword(),
+              opts :: keyword()
+            ) :: tensor | no_return()
+  @callback to_pointer(tensor, opts :: keyword) :: term() | no_return()
 
   @callback as_type(out :: tensor, tensor) :: tensor
   @callback bitcast(out :: tensor, tensor) :: tensor
-  @callback reshape(out :: tensor, tensor, shape) :: tensor
+  @callback reshape(out :: tensor, tensor) :: tensor
   @callback squeeze(out :: tensor, tensor, axes) :: tensor
   @callback broadcast(out :: tensor, tensor, shape, axes) :: tensor
   @callback transpose(out :: tensor, tensor, axes) :: tensor
@@ -65,15 +78,14 @@ defmodule Nx.Backend do
   @callback clip(out :: tensor, tensor, min :: tensor, max :: tensor) :: tensor
   @callback slice(out :: tensor, tensor, list, list, list) :: tensor
   @callback put_slice(out :: tensor, tensor, tensor, list) :: tensor
-  @callback take(out :: tensor, input :: tensor, indices :: tensor, axis) :: tensor
-  @callback take_along_axis(out :: tensor, input :: tensor, indices :: tensor, axis) :: tensor
-  @callback gather(out :: tensor, input :: tensor, indices :: tensor) :: tensor
+  @callback gather(out :: tensor, input :: tensor, indices :: tensor, keyword) :: tensor
   @callback concatenate(out :: tensor, tensor, axis) :: tensor
+  @callback stack(out :: tensor, tensor, axis) :: tensor
   @callback select(out :: tensor, tensor, tensor, tensor) :: tensor
 
   @callback conv(out :: tensor, tensor, kernel :: tensor, keyword) :: tensor
-  @callback all?(out :: tensor, tensor, keyword) :: tensor
-  @callback any?(out :: tensor, tensor, keyword) :: tensor
+  @callback all(out :: tensor, tensor, keyword) :: tensor
+  @callback any(out :: tensor, tensor, keyword) :: tensor
   @callback sum(out :: tensor, tensor, keyword) :: tensor
   @callback product(out :: tensor, tensor, keyword) :: tensor
   @callback reduce_max(out :: tensor, tensor, keyword) :: tensor
@@ -81,45 +93,60 @@ defmodule Nx.Backend do
   @callback argmax(out :: tensor, tensor, keyword) :: tensor
   @callback argmin(out :: tensor, tensor, keyword) :: tensor
   @callback reduce(out :: tensor, tensor, acc :: tensor, keyword, fun) :: tensor
-  @callback reduce_window(out :: tensor, tensor, acc :: tensor, shape, keyword, fun) :: tensor
+  @callback window_reduce(out :: tensor, tensor, acc :: tensor, shape, keyword, fun) :: tensor
   @callback window_sum(out :: tensor, tensor, shape, keyword) :: tensor
   @callback window_product(out :: tensor, tensor, shape, keyword) :: tensor
   @callback window_max(out :: tensor, tensor, shape, keyword) :: tensor
   @callback window_min(out :: tensor, tensor, shape, keyword) :: tensor
-  @callback map(out :: tensor, tensor, keyword, fun) :: tensor
   @callback sort(out :: tensor, tensor, keyword) :: tensor
   @callback argsort(out :: tensor, tensor, keyword) :: tensor
-  @callback scatter_window_max(out :: tensor, tensor, tensor, shape, keyword, tensor) :: tensor
-  @callback scatter_window_min(out :: tensor, tensor, tensor, shape, keyword, tensor) :: tensor
-  @callback scatter_add(out :: tensor, tensor, tensor, tensor) :: tensor
+  @callback window_scatter_max(out :: tensor, tensor, tensor, tensor, shape, keyword) :: tensor
+  @callback window_scatter_min(out :: tensor, tensor, tensor, tensor, shape, keyword) :: tensor
+  @callback indexed_add(out :: tensor, tensor, indices :: tensor, updates :: tensor, keyword) ::
+              tensor
+  @callback indexed_put(out :: tensor, tensor, indices :: tensor, updates :: tensor, keyword) ::
+              tensor
 
-  @callback cholesky(out :: tensor, tensor) :: tensor
-  @callback lu({p :: tensor, l :: tensor, u :: tensor}, tensor, keyword) :: tensor
-  @callback qr({q :: tensor, r :: tensor}, tensor, keyword) :: tensor
   @callback triangular_solve(out :: tensor, a :: tensor, b :: tensor, keyword) :: tensor
-  @callback eigh({eigenvals :: tensor, eigenvecs :: tensor}, tensor, keyword) :: tensor
-  @callback svd({u :: tensor, s :: tensor, v :: tensor}, tensor, keyword) :: tensor
+
+  @callback fft(out :: tensor, tensor, keyword) :: tensor
+  @callback ifft(out :: tensor, tensor, keyword) :: tensor
 
   binary_ops =
-    [:add, :subtract, :multiply, :power, :remainder, :divide, :atan2, :min, :max, :quotient] ++
+    [:add, :subtract, :multiply, :pow, :remainder, :divide, :atan2, :min, :max, :quotient] ++
       [:bitwise_and, :bitwise_or, :bitwise_xor, :left_shift, :right_shift] ++
       [:equal, :not_equal, :greater, :less, :greater_equal, :less_equal] ++
-      [:logical_and, :logical_or, :logical_xor] ++
-      [:outer]
+      [:logical_and, :logical_or, :logical_xor]
 
   for binary_op <- binary_ops do
-    @callback unquote(binary_op)(out :: t, t, t) :: t
+    @callback unquote(binary_op)(out :: tensor, tensor, tensor) :: tensor
   end
 
   unary_ops =
     Enum.map(Nx.Shared.unary_math_funs(), &elem(&1, 0)) ++
-      [:abs, :bitwise_not, :ceil, :floor, :negate, :round, :sign] ++
-      [:count_leading_zeros, :population_count]
+      [:abs, :bitwise_not, :ceil, :conjugate, :floor, :negate, :round, :sign] ++
+      [:count_leading_zeros, :population_count, :real, :imag, :is_nan, :is_infinity]
 
   for unary_op <- unary_ops do
-    @callback unquote(unary_op)(out :: t, t) :: t
+    @callback unquote(unary_op)(out :: tensor, tensor) :: tensor
   end
 
+  ## Block extension
+
+  @doc """
+  Invoked for execution of `Nx.block/4`.
+
+  `output` is the result template (`Nx.Tensor` or tuple of tensors). `args` are
+  the tensors or containers of tensors (and optional trailing keyword lists)
+  passed to `Nx.block/4`.
+  Backends should dispatch on `struct` (see `Nx.Block.*`) and either run a
+  native implementation or invoke `fun` as `apply(fun, [struct | args])`.
+  """
+  @callback block(struct, output :: tensor | tuple, args :: [term], fun) :: tensor | tuple
+
+  ## Inspect implementation
+
+  require Nx.Shared
   alias Inspect.Algebra, as: IA
 
   @doc """
@@ -127,7 +154,7 @@ defmodule Nx.Backend do
 
   Note the `binary` may have fewer elements than the
   tensor size but, in such cases, it must strictly have
-  more elements than `inspect_opts.limit`
+  more elements than `inspect_opts.limit`.
   """
   def inspect(%{shape: shape, type: type}, binary, inspect_opts) do
     open = IA.color("[", :list, inspect_opts)
@@ -135,30 +162,32 @@ defmodule Nx.Backend do
     close = IA.color("]", :list, inspect_opts)
 
     dims = Tuple.to_list(shape)
-    {data, _rest, _limit} = chunk(dims, binary, type, inspect_opts.limit, {open, sep, close})
+
+    {data, _rest, _limit} =
+      chunk(dims, binary, type, inspect_opts.limit, {open, sep, close})
+
     data
   end
 
-  defp chunk([], data, {kind, size}, limit, _docs) do
-    # TODO: Simplify inspection once nonfinite are officially supported in the VM
-
+  defp chunk([], data, type, limit, _docs) do
     {doc, tail} =
-      case kind do
-        :s ->
-          <<head::size(size)-signed-native, tail::binary>> = data
-          {Integer.to_string(head), tail}
+      case type do
+        {:s, size} ->
+          <<seg::size(^size)-signed-integer-native, tail::bitstring>> = data
+          {Integer.to_string(seg), tail}
 
-        :u ->
-          <<head::size(size)-unsigned-native, tail::binary>> = data
-          {Integer.to_string(head), tail}
+        {:u, size} ->
+          <<seg::size(^size)-unsigned-integer-native, tail::bitstring>> = data
+          {Integer.to_string(seg), tail}
 
-        :f ->
-          <<head::size(size)-bitstring, tail::binary>> = data
-          {inspect_float(head, size), tail}
+        {:c, size} ->
+          half = div(size, 2)
+          <<re::size(^half)-bitstring, im::size(^half)-bitstring, tail::binary>> = data
+          {complex_to_string(re, im, half), tail}
 
-        :bf ->
-          <<head::16-bitstring, tail::binary>> = data
-          {inspect_bf16(head), tail}
+        {type, size} ->
+          <<float::size(^size)-bitstring, tail::bitstring>> = data
+          {float_to_string(float, type, size), tail}
       end
 
     if limit == :infinity, do: {doc, tail, limit}, else: {doc, tail, limit - 1}
@@ -199,47 +228,42 @@ defmodule Nx.Backend do
     chunk_each(dim - 1, rest, [doc | acc], limit, fun)
   end
 
-  defp inspect_bf16(<<0xFF80::16-native>>), do: "-Inf"
-  defp inspect_bf16(<<0x7F80::16-native>>), do: "Inf"
-  defp inspect_bf16(<<0xFFC1::16-native>>), do: "NaN"
-  defp inspect_bf16(<<0xFF81::16-native>>), do: "NaN"
+  defp float_to_string(<<float::64-float-native>>, :f, 64),
+    do: Float.to_string(float)
 
-  if System.endianness() == :little do
-    defp inspect_bf16(bf16) do
-      <<x::float-little-32>> = <<0::16, bf16::binary>>
-      Float.to_string(x)
-    end
-  else
-    defp inspect_bf16(bf16) do
-      <<x::float-big-32>> = <<bf16::binary, 0::16>>
-      Float.to_string(x)
-    end
-  end
+  defp float_to_string(binary, :f, 64),
+    do:
+      (case Nx.Shared.read_non_finite(binary, 64) do
+         :nan -> "NaN"
+         :infinity -> "Inf"
+         :neg_infinity -> "-Inf"
+       end)
 
-  defp inspect_float(data, 16) do
-    case data do
-      <<0xFC00::16-native>> -> "-Inf"
-      <<0x7C00::16-native>> -> "Inf"
-      <<x::float-16-native>> -> Float.to_string(x)
-      _ -> "NaN"
-    end
-  end
+  defp float_to_string(<<bits::32-native-unsigned>>, :f, 32),
+    do: Nx.Ryu.bits_to_decimal(bits, 23, 8)
 
-  defp inspect_float(data, 32) do
-    case data do
-      <<0xFF800000::32-native>> -> "-Inf"
-      <<0x7F800000::32-native>> -> "Inf"
-      <<x::float-32-native>> -> Float.to_string(x)
-      _ -> "NaN"
-    end
-  end
+  defp float_to_string(<<bits::16-native-unsigned>>, :f, 16),
+    do: Nx.Ryu.bits_to_decimal(bits, 10, 5)
 
-  defp inspect_float(data, 64) do
-    case data do
-      <<0x7FF0000000000000::64-native>> -> "Inf"
-      <<0xFFF0000000000000::64-native>> -> "-Inf"
-      <<x::float-64-native>> -> Float.to_string(x)
-      _ -> "NaN"
-    end
+  defp float_to_string(<<bits::8-native-unsigned>>, :f, 8),
+    do: Nx.Ryu.bits_to_decimal(bits, 2, 5)
+
+  defp float_to_string(<<bits::16-native-unsigned>>, :bf, 16),
+    do: Nx.Ryu.bits_to_decimal(bits, 7, 8)
+
+  defp float_to_string(<<bits::8-native-unsigned>>, :f8_e4m3fn, 8),
+    do: Nx.Ryu.bits_to_decimal(bits, 3, 4, :fn)
+
+  defp complex_to_string(re, im, float_unit) do
+    re_str = float_to_string(re, :f, float_unit)
+    im_str = float_to_string(im, :f, float_unit)
+
+    im_str =
+      case im_str do
+        "-" <> _ -> im_str
+        s -> "+" <> s
+      end
+
+    re_str <> im_str <> "i"
   end
 end

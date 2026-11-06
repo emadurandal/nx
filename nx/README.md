@@ -1,20 +1,30 @@
 <h1><img src="https://github.com/elixir-nx/nx/raw/main/nx/nx.png" alt="Nx" width="400"></h1>
 
+[![Package](https://img.shields.io/badge/-Package-important)](https://hex.pm/packages/nx) [![Documentation](https://img.shields.io/badge/-Documentation-blueviolet)](https://hexdocs.pm/nx)
+
 Nx is a multi-dimensional tensors library for Elixir with multi-staged compilation to the CPU/GPU. Its high-level features are:
 
-  * Typed multi-dimensional tensors, where the tensors can be unsigned integers (`u8`, `u16`, `u32`, `u64`), signed integers (`s8`, `s16`, `s32`, `s64`), floats (`f32`, `f64`) and brain floats (`bf16`);
+  * Typed multi-dimensional tensors, where the tensors can be unsigned integers (`u2`, `u4`, `u8`, `u16`, `u32`, `u64`), signed integers (`s2`, `s4`, `s8`, `s16`, `s32`, `s64`), floats (`f16`, `f32`, `f64`), quantized floats (`f8` (E5M2), `f8_e4m3fn`), brain floats (`bf16`), and complex numbers (`c64`, `c128`);
 
   * Named tensors, allowing developers to give names to each dimension, leading to more readable and less error prone codebases;
 
   * Automatic differentiation, also known as autograd. The `grad` function provides reverse-mode differentiation, useful for simulations, training probabilistic models, etc;
 
-  * Tensors backends, which enables the main `Nx` API to be used to manipulate binary tensors, GPU-backed tensors, sparse matrices, and more;
+  * Auto-vectorization and auto-batching, which allow developers to elegantly transform numerical code that only work on specific dimensions, into code that efficiently runs on higher dimensions in parallel
 
-  * Numerical definitions, known as `defn`, provide multi-stage compilation of tensor operations to multiple targets, such as highly specialized CPU code or the GPU. The compilation happens just-in-time (JIT) with a compiler of your choice;
+  * Numerical definitions, known as `defn`, is a subset of Elixir that is compilable to multiple targets, including GPUs. See [EXLA](https://github.com/elixir-nx/nx/tree/main/exla) for just-in-time (JIT) compilation for CPUs/GPUs/TPUs and [Torchx](https://github.com/elixir-nx/nx/tree/main/torchx) or [Candlex](https://github.com/mimiquate/candlex) for CPUs/GPUs support;
+
+  * Built-in distributed² serving: encapsulate complex numerical pipelines into `Nx.Serving`. Servings provide batching, streaming, and partitioning out of the box. You can distribute servings over multiple CPU cores and GPU devices, as well as over a cluster of machines;
+
+  * Support for io_calls, allowing developers to send and receive data from CPUs/GPUs/TPUs while computations are running;
+
+  * Support for linear algebra primitives via `Nx.LinAlg`;
 
 You can find planned enhancements and features in the issues tracker. If you need one particular feature to move forward, don't hesitate to let us know and give us feedback.
 
-For Python developers, `Nx` currently takes its main inspirations from [`Numpy`](https://numpy.org/) and [`JAX`](https://github.com/google/jax) but packaged into a single unified library.
+For Python developers, `Nx` packages features from [`Numpy`](https://numpy.org/), [`JAX`](https://github.com/google/jax), [HuggingFace Pipelines](https://huggingface.co/docs/transformers/main_classes/pipelines), and TorchServing/TensorServing, but packaged into a single unified library and developer experience.
+
+See [the Nx organization on GitHub](https://github.com/elixir-nx) to learn about other Numerical Elixir projects. For signal processing and general (non-batched N-D) convolution, see [`NxSignal`](https://github.com/elixir-nx/nx_signal).
 
 ## Community
 
@@ -36,20 +46,6 @@ In order to support Nx, you might:
 
   * Nx's mascot is the Numbat, a marsupial native to southern Australia. Unfortunately the Numbat are endangered and it is estimated to be fewer than 1000 left. If you enjoy this project, consider donating to Numbat conservation efforts, such as [Project Numbat](https://www.numbat.org.au/) and [Australian Wildlife Conservancy](https://www.australianwildlife.org). The Project Numbat website also contains Numbat related swag.
 
-## Resources
-
-Here are some introductory resources with more information on Nx as a whole:
-
-  * [A post by José Valim on Dashbit's blog announcing Nx, outlining some of the design decisions, benchmarks, and general direction](https://dashbit.co/blog/nx-numerical-elixir-is-now-publicly-available) (text)
-
-  * [Sean Moriarity's blog](https://seanmoriarity.com/) containing tips on how to use Nx (text)
-
-  * [The ThinkingElixir podcast where José Valim unveiled Nx](https://thinkingelixir.com/podcast-episodes/034-jose-valim-reveals-project-nx/) (audio - starts around 8 minutes in)
-
-  * [A talk by José Valim at Lambda Days 2021 where he builds a neural network from scratch with Nx](https://www.youtube.com/watch?v=fPKMmJpAGWc) (video)
-
-  * [A screencast by José Valim announcing Livebook, where he also showcases Nx and Axon (a neural network library built on top of Nx)](https://www.youtube.com/watch?v=RKvqc-UEe34) (video)
-
 ## Installation
 
 In order to use `Nx`, you will need Elixir installed. Then create an Elixir project via the `mix` build tool:
@@ -58,14 +54,22 @@ In order to use `Nx`, you will need Elixir installed. Then create an Elixir proj
 $ mix new my_app
 ```
 
-Then you can add `Nx` as dependency in your `mix.exs`. At the moment you will have to use a Git dependency while we work on our first release:
+Then you can add `Nx` as dependency in your `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:nx, "~> 0.1.0-dev", github: "elixir-nx/nx", branch: "main", sparse: "nx"}
+    {:nx, "~> 1.0"}
   ]
 end
+```
+
+If you are using Livebook or IEx, you can instead run:
+
+```elixir
+Mix.install([
+  {:nx, "~> 1.0"}
+])
 ```
 
 ## Examples
@@ -93,11 +97,11 @@ iex> Nx.divide(Nx.exp(t), Nx.sum(Nx.exp(t)))
 >
 ```
 
+By default, `Nx` uses pure Elixir code. Since Elixir is a functional and immutable language, each operation above makes a copy of the tensor, which is quite innefficient. You can use either [EXLA](https://github.com/elixir-nx/nx/tree/main/exla), [Torchx](https://github.com/elixir-nx/nx/tree/main/torchx) or [Candlex](https://github.com/mimiquate/candlex) backends for an improvement in performance, often over 3 orders of magnitude, as well as the ability to work on the data in the GPU. See the README of those projects for more information.
+
 ## Numerical definitions
 
-By default, `Nx` uses pure Elixir code. Since Elixir is a functional and immutable language, each operation above makes a copy of the tensor, which is quite innefficient.
-
-However, `Nx` also comes with numerical definitions, called `defn`, which is a subset of Elixir tailored for numerical computations. For example, it overrides Elixir's default operators so they are tensor-aware:
+`Nx` also comes with numerical definitions, called `defn`, which is a subset of Elixir tailored for numerical computations. For example, it overrides Elixir's default operators so they are tensor-aware:
 
 ```elixir
 defmodule MyModule do
@@ -109,16 +113,26 @@ defmodule MyModule do
 end
 ```
 
-`defn` supports multiple compiler backends, which can compile said functions to run on the CPU or in the GPU. For example, [using the `EXLA` compiler](https://github.com/elixir-nx/nx/tree/main/exla), which provides bindings to Google's XLA:
+You can now invoke it as:
 
 ```elixir
-@defn_compiler {EXLA, client: :host}
-defn softmax(t) do
-  Nx.exp(t) / Nx.sum(Nx.exp(t))
-end
+MyModule.softmax(Nx.tensor([1, 2, 3]))
 ```
 
-Once `softmax` is called, `Nx.Defn` will invoke `EXLA` to emit a just-in-time and high-specialized compiled version of the code, tailored to the input tensors type and shape. By passing `client: :cuda` or `client: :rocm`, the code can be compiled for the GPU. For reference, here are some benchmarks of the function above when called with a tensor of one million random float values:
+`defn` relies on a technique called multi-stage programming, which is built on top of Elixir functional and meta-programming capabilities: we transform Elixir code to build a graph of your numerical definitions. This brings two important capabilities:
+
+  1. We can transform this graph to provide features such as automatic differentiation, type lowering, and more
+
+  2. We support custom compilers, which can compile said definitions to run on the CPU and GPU just-in-time
+
+For example, [using the `EXLA` compiler](https://github.com/elixir-nx/nx/tree/main/exla), which provides bindings to Google's XLA:
+
+```elixir
+will_jit = EXLA.jit(&MyModule.softmax/1)
+will_jit.(some_tensor)
+```
+
+Once `softmax` is called, `EXLA` will emit a just-in-time and high-specialized compiled version of the code, tailored to the input tensors type and shape. By setting the `XLA_TARGET` environment variable to `cuda` or `rocm`, the code can be compiled for the GPU. For reference, here are some benchmarks of the function above when called with a tensor of one million random float values:
 
 ```
 Name                       ips        average  deviation         median         99th %
@@ -144,9 +158,25 @@ elixir f64                3.11 - 4924.56x slower +321.63 ms
 
 See the [`bench`](https://github.com/elixir-nx/nx/tree/main/exla/bench) and [`examples`](https://github.com/elixir-nx/nx/tree/main/exla/examples) directory inside the EXLA project for more information.
 
-`defn` relies on a technique called multi-stage programming, which is built on top of Elixir functional and meta-programming capabilities: we transform Elixir code to emit an AST that is then transformed to run on the CPU/GPU. Ultimately, the `defn` compiler is pluggable, which means developers can implement bindings for different tensor compiler technologies and choose the most appropriate one.
+Many of Elixir's features are supported inside `defn`, such as the pipe operator, aliases, conditionals, pattern-matching, and more. It also brings exclusive features to numerical definitions, such as `while` loops, automatic differentiation via the `grad` function, io_calls to inspect data running on the GPU, and more.
 
-Many of Elixir's features are supported inside `defn`, such as the pipe operator, aliases, conditionals, pattern-matching, and more. Other features such as loops and in-place updates are on the roadmap. `defn` also support `transforms`, which allows numerical definitions to be transformed at runtime. Automatic differentiation, via the `grad` function, is one example of transforms.
+## Working with processes
+
+Elixir runs on the Erlang Virtual Machine, which runs your code inside lightweight thread of executions called "processes". Sending tensors between processes is done by sharing, no copying is required. The tensors are then [refcounted](https://en.wikipedia.org/wiki/Reference_counting) and garbage collected once all processes no longer hold a reference to them.
+
+Nx also allows developers to run different Erlang VM processes, each against a different GPU device. For using, with EXLA, one could do:
+
+```elixir
+Nx.default_backend({EXLA.Backend, client: :cuda, device_id: 1})
+```
+
+or:
+
+```elixir
+will_jit = EXLA.jit(&MyModule.softmax/1, client: :cuda, device_id: 1)
+```
+
+And, from that moment on, all operations will happen within a particular GPU instance. You can then use Elixir's message-passing abilities to coordinate the necessary work across processes.
 
 ## License
 

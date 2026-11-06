@@ -1,45 +1,96 @@
 defmodule EXLA do
   @moduledoc """
-  Bindings and Nx integration for [Google's XLA](https://www.tensorflow.org/xla/).
+  [Google's XLA](https://www.tensorflow.org/xla/) (Accelerated Linear Algebra) compiler/backend for Nx.
 
-  ## defn compiler
+  It supports just-in-time (JIT) compilation to GPU (both CUDA and ROCm) and TPUs.
 
-  Most often, this library will be used as `Nx.Defn` compiler, like this:
+  ## XLA binaries
 
-      @defn_compiler EXLA
-      defn softmax(tensor) do
-        Nx.exp(n) / Nx.sum(Nx.exp(n))
-      end
+  EXLA relies on the `XLA` package to provide the necessary XLA binaries.
+  Whenever possible it tries to download precompiled builds, but you may
+  need to build from source if there is no version matching your target
+  environment. For more details, including GPU/TPU support and requirements
+  see the `XLA` docs.
 
-  Then, every time `softmax/1` is called, EXLA will just-in-time (JIT)
-  compile a native implementation of the function above, tailored for the
-  type and shape of the given tensor.
+  > #### Version requirements {: .info}
+  >
+  > For precise requirements, such as CUDA and cuDNN versions, see `XLA` docs.
 
-  EXLA is able to compile to the CPU or GPU, by customizing the default
-  client or specifying your own client:
+  ## Configuration
 
-      @defn_compiler {EXLA, client: :cuda}
-      defn softmax(tensor) do
-        Nx.exp(n) / Nx.sum(Nx.exp(n))
-      end
+  EXLA ships with a backend to store tensors and run computations on.
+  Generally speaking, the backend is enabled globally in your `config/config.exs`
+  (or `config/ENV.exs`) with the following:
 
-  Read the "Client" section below for more information.
+      import Config
+      config :nx, :default_backend, EXLA.Backend
+
+  In a script/notebook, you would do:
+
+      Mix.install([
+        {:exla, "~> 1.0"}
+      ])
+
+      Nx.global_default_backend(EXLA.Backend)
+
+  From now on, all created tensors will be allocated directly on the given
+  `EXLA.Backend`. You can use functions such as `Nx.backend_transfer/2` to
+  explicitly transfer tensors.
+
+  EXLA will pick an available client to allocate and compute tensors, in this
+  order: `:cuda`, `:rocm`, `:tpu`, and `:host` (CPU). See the "Clients" section
+  below for more information.
+
+  To use GPUs/TPUs, you must also set the appropriate value for the
+  [`XLA_TARGET`](https://github.com/elixir-nx/xla#xla_target) environment
+  variable. If you have GPU/TPU enabled, we recommend setting the environment
+  variable for your machine altogether. For CUDA, setting
+  `ELIXIR_ERL_OPTIONS="+sssdio 128"` is also required on more complex operations
+  to increase CUDA's compiler stack size.
+
+  Note that setting the `EXLA.Backend` does not enable the EXLA compiler.
+  You must still pass the `compiler: EXLA` option to `Nx.Defn` functions
+  or call the functions in this module.
 
   ### Options
 
-  The options accepted by the EXLA compiler are:
+  The options accepted by EXLA backend/compiler are:
 
-    * `:client` - an atom representing the client to use. Defaults
-      to `:default`. See "Clients" section
+    * `:client` - an atom representing the client to use. The default
+      client is chosen on this order: `:cuda`, `:rocm`, `:tpu`, and `:host`.
 
     * `:device_id` - the default device id to run the computation
         on. Defaults to the `:default_device_id` on the client
 
-    * `:run_options` - options given when running the computation:
+    * `:precision` - control the tradeoff between speed and accuracy for
+      array computations on accelerator backends (i.e. TPU and GPU).
+      It must be one of:
 
-      * `:keep_on_device` - if the data should be kept on the device,
-        useful if multiple computations are done in a row. See
-        "Device allocation" section
+      * `:default` - Fastest mode, but least accurate. Performs computations
+        in bfloat16
+
+      * `:high` - Slower but more accurate. Performs float32 computations in
+        3 bfloat16 passes, or using tensorfloat32 where available
+
+      * `:highest` - Slowest but most accurate. Performs computations in float32
+        or float64 as applicable
+
+  ## Native custom calls (`EXLA.CustomCall`)
+
+  Some `Nx.block/4` tags can be lowered to XLA **custom calls** (StableHLO plus
+  a registered native handler). Implement the `EXLA.CustomCall` protocol for
+  your block tag struct; see `EXLA.CustomCall` for the `call/4` contract,
+  including returning `:skip` to fall back to the block's default Elixir callback.
+
+  The native library implementing the handler is loaded with `load_dylib/1`,
+  which must happen before compiling any function that emits the target name.
+
+  Backend-specific behaviour, options, and limitations for Nx functions are
+  documented in the [Backend documentation](backend_documentation.html) guides
+  (for example [Nx](backend_documentation-nx.html) and
+  [Nx.LinAlg](backend_documentation-nx_lin_alg.html)). See also the
+  [backend documentation convention](https://hexdocs.pm/nx/backend_documentation-convention.html)
+  in the Nx package.
 
   ## Clients
 
@@ -49,53 +100,89 @@ defmodule EXLA do
 
   Those clients are singleton resources on Google's XLA library,
   therefore they are treated as a singleton resource on this library
-  too. You can configure a client via the application environment.
-  For example, to configure the default client:
+  too. EXLA ships with runtime client configuration for each supported
+  platform:
 
       config :exla, :clients,
-        default: [platform: :host]
-
-  `platform: :host` is the default value. You can configure it to
-  use the GPU though:
-
-      config :exla, :clients,
-        default: [platform: :cuda]
-
-  For convenience, EXLA ships with the client configuration for each
-  additional platform, which would be the equivalent to this:
-
-      config :exla, :clients,
-        default: [],
         cuda: [platform: :cuda],
         rocm: [platform: :rocm],
-        tpu: [platform: :tpu]
+        tpu: [platform: :tpu],
+        host: [platform: :host]
 
-  However, you should avoid using multiple clients for the same platform.
-  If you have multiple clients per platform, they can race each other
-  and fight for resources, such as memory. Therefore, we recommend developers
-  to stick with the `:default` client as much as possible and configure it
-  accordingly. Use the other clients only during scripting for convenience.
+  In a script/notebook, you can set those after `Mix.install/2`,
+  but before any tensor operation is performed:
+
+      Application.put_env(:exla, :clients,
+        cuda: [platform: :cuda],
+        rocm: [platform: :rocm],
+        tpu: [platform: :tpu],
+        host: [platform: :host]
+      )
+
+  You can provide your own list of clients, replacing the list above
+  or configuring each client as listed below. You can also specify
+  `:default_client` to set a particular client by default or
+  `:preferred_clients` to change the order of clients preference,
+  but those configurations are rarely set in practice.
+
+  > **Important!** you should avoid using multiple clients for the
+  > same platform. If you have multiple clients per platform, they
+  > can race each other and fight for resources, such as memory.
+  > Therefore, we recommend developers to stick with the default
+  > clients above.
 
   ### Client options
 
   Each client configuration accepts the following options:
 
     * `:platform` - the platform the client runs on. It can be
-      `:host` (CPU), `:cuda`, `:rocm`, or `:tpu`
+      `:host` (CPU), `:cuda`, `:rocm`, `:tpu`, or `:pjrt_plugin` (an
+      externally loaded PJRT plugin, see below). Defaults to `:host`.
+
+    * `:device_type` - required for the `:pjrt_plugin` platform. The device
+      type string the PJRT plugin registers under (for example `"tt"`).
+
+    * `:plugin_path` - required for the `:pjrt_plugin` platform. The path to
+      the PJRT plugin shared library to load (for example the tt-xla
+      `pjrt_plugin_tt.so`).
 
     * `:default_device_id` - the default device ID to run on.
-      For example, if you have two GPUs, you can choose one as
-      the default
+      For example, if you have two GPUs, you can choose a different
+      one as the default. Defaults to device 0 (the first device).
 
     * `:preallocate`- if the memory should be preallocated on
-      GPU devices. Defaults to `true`
+      GPU devices. Defaults to `true`.
 
     * `:memory_fraction` - how much memory of a GPU device to
-      allocate. Defaults to `0.9.`
+      allocate. Defaults to `0.9`.
+
+  ### External PJRT plugins (`:pjrt_plugin`)
+
+  Besides the built-in platforms, EXLA can target any hardware that ships
+  a PJRT C-API plugin (a shared library) by loading it at runtime. Use the
+  `:pjrt_plugin` platform together with `:device_type` and `:plugin_path`:
+
+      config :exla, :clients,
+        tt: [platform: :pjrt_plugin, device_type: "tt", plugin_path: "/path/to/pjrt_plugin_tt.so"]
+
+  The plugin is loaded via its `GetPjrtApi` entrypoint and registered under
+  `:device_type`. Any environment the plugin itself requires (for example a
+  vendor runtime root directory) must be set in the OS environment before the
+  VM starts; EXLA does not manage it.
+
+  ### Memory preallocation
+
+  XLA preallocates memory in GPU devices. This means that, if you are to
+  run multiple notebooks or multiple instances of your application, the
+  second, third, and so on instances won't be able to allocate memory.
+
+  You can disable this behaviour by setting `preallocate: false` on the
+  client configuration, as specified above. You may also use
+  `:memory_fraction` to control how much is preallocated.
 
   ### GPU Runtime Issues
 
-  GPU Executions run in dirty IO threads, which have a considerable smaller
+  GPU Executions run in dirty IO threads, which have a considerably smaller
   stack size than regular scheduler threads. This may lead to problems with
   certain CUDA or cuDNN versions, leading to segmentation fails. In a development
   environment, it is suggested to set:
@@ -105,48 +192,16 @@ defmodule EXLA do
   To increase the stack size of dirty IO threads from 40 kilowords to
   128 kilowords. In a release, you can set this flag in your `vm.args`.
 
-  ## Device allocation
+  ## Distribution
 
-  EXLA also ships with a `EXLA.DeviceBackend` that allows data
-  to be either be explicitly allocated or kept on the EXLA device
-  after a computation. For example:
+  EXLA allows its tensors to be sent across nodes, as long as the parent
+  node (which effectively holds the tensor) keeps a reference to the
+  tensor while it is read by any other node it was sent to.
 
-      @defn_compiler {EXLA, run_options: [keep_on_device: true]}
-      defn softmax(tensor) do
-        Nx.exp(n) / Nx.sum(Nx.exp(n))
-      end
-
-  Will keep the computation on the device, either the CPU or GPU.
-  For CPU, this is actually detrimental, as allocating an Elixir
-  binary has the same cost as keeping it on CPU, but this yields
-  important performance benefits on the GPU.
-
-  If data is kept on the device, you can pipe it into other `defn`
-  computations running on the same compiler (in this case, the
-  `EXLA` compiler) but you cannot use the regular `Nx` operations,
-  unless you transfer it back:
-
-      Nx.tensor([1, 2, 3, 4])
-      |> softmax()
-      |> Nx.backend_transfer() # bring the data back to Elixir
-
-  You can also use `Nx.backend_transfer/1` to put data on a given
-  device before invoking a `defn` function:
-
-      # Explicitly move data to the device, useful for GPU
-      Nx.backend_transfer(Nx.tensor([1, 2, 3, 4]), EXLA.DeviceBackend)
-
-  If instead you want to make a copy of the data, you can use
-  `Nx.backend_copy/1` instead. However, when working with large
-  data, be mindful of memory allocations.
-
-  > **Important!** EXLA operations and the `defn` compiler do not
-  take the input devices into account when executing. So, if you
-  transfer a tensor to the GPU, by explicitly passing the client
-  to be CUDA, but then your default client runs on the CPU, the
-  tensors will be transferred back to CPU before execution. That's
-  why it is important to configure the `:default` client with your
-  desired specifications.
+  The result of `EXLA.compile/3` can also be shared across nodes.
+  On invocation, the underlying executable is automatically serialized
+  and sent to other nodes, without requiring a full recompilation,
+  as long as the same conditions as above apply.
 
   ## Docker considerations
 
@@ -155,53 +210,358 @@ defmodule EXLA do
   That's because when the Erlang VM runs as root, it has to manage
   all child programs.
 
-  At the same time, Google XLA's shells out to child program during
-  compilation and it must retain control over how child programs
-  terminate.
+  At the same time, Google's XLA shells out to child programs and
+  must retain control over how child programs terminate.
 
   To address this, simply make sure you wrap the Erlang VM in
-  another process, such as the shell one. In other words, if you
+  another process, such as a shell process. In other words, if you
   are using releases, instead of this:
 
-      RUN path/to/release start
+      CMD path/to/release start
 
   do this:
 
-      RUN sh -c "path/to/release start"
+      CMD sh -c "path/to/release start"
 
   If you are using Mix inside your Docker containers, instead of this:
 
-      RUN mix run
+      CMD mix run
 
   do this:
 
-      RUN sh -c "mix run"
+      CMD sh -c "mix run"
 
-  Alternatively, you can pass the `--init` flag to `docker run`, so
-  it runs an `init` inside the container that forwards signals and
-  reaps processes.
+  Alternatively, you can pass the `--init` flag to `docker run`,
+  so it runs an `init` inside the container that forwards signals
+  and reaps processes.
+
+  The `--init` flag uses the [`tini`](https://github.com/krallin/tini)
+  project, so for cases where the flag may not available (e.g.
+  kubernetes) you may want to install it.
+
+  ## Telemetry events
+
+  EXLA executes a telemetry event every time a function is JIT-compiled.
+  The events are named `[:exla, :compilation]` and include the following
+  measurements, given in microseconds:
+
+    * `:eval_time` - the time spent on turning the function into XLA
+      computation
+    * `:compile_time` - the time spent on compiling the XLA computation
+      into an executable
+    * `:total_time` - the sum of `:eval_time` and `:compile_time`
+
+  The metadata is:
+
+    * `:key` - the compilation key for debugging
+
+  ## Sharding
+
+  EXLA supports sharding by default through the `EXLA.shard_jit/3` function
+  and XLA's automatic SPMD partitioning. This means that you can write a function
+  and provide input sharding information along with sharded inputs, and the function
+  will automatically propagate and partition the computation across the devices
+  in a best-effort approach.
   """
 
   @behaviour Nx.Defn.Compiler
 
   @doc """
-  A shortcut for `Nx.Defn.jit/4` with the EXLA compiler.
+  A shortcut for `Nx.Defn.jit/2` with the EXLA compiler.
 
-      iex> EXLA.jit(&Nx.add(&1, &1), [Nx.tensor([1, 2, 3])])
+      iex> EXLA.jit(&Nx.add(&1, &1)).(Nx.tensor([1, 2, 3]))
       #Nx.Tensor<
-        s64[3]
+        s32[3]
         [2, 4, 6]
       >
 
-  See the moduledoc for options.
+  Results are allocated on the `EXLA.Backend`. Note that the
+  `EXLA.Backend` is asynchronous: operations on its tensors
+  *may* return immediately, before the tensor data is available.
+  The backend will then block only when trying to read the data
+  or when passing it to another operation.
+
+  ## Options
+
+  It accepts the same option as `Nx.Defn.jit/2` plus:
+
+    * `:cache` - cache the results of compilation, defaults to `true`.
+      You may disable it by setting it to `false`. You can also set it
+      to a binary, representing a filesystem path to store the cache.
+      EXLA will ensure the arguments and parameters across invocations
+      have the same shape, but it is ultimately your responsibility
+      to provide a unique cache path.
+
+    * `:client` - an atom representing the client to use. The default
+      client is chosen on this order: `:cuda`, `:rocm`, `:tpu`, and `:host`.
+
+    * `:debug` - print compile and debugging information, defaults to `false`.
+
+    * `:device_id` - the default device id to run the computation on.
+      Defaults to the `:default_device_id` on the client
+
+    * `:lazy_transfers` - when `:always`, it lazily transfers data to the device
+      instead of upfront. This is useful to reduce memory allocation on GPU/TPU
+      devices at the cost of increased latency. **It is recommended to only enable
+      this if the input tensors are allocated on host and the computation is
+      running on GPU/TPU with a limited amount of memory**
+
+  ## Buffer donation
+
+  You can mark tensors as donatable with `Nx.donatable/1`. When those tensors
+  are passed to `jit/2`, or when both the templates and the live arguments
+  are marked for `compile/3`, EXLA may reuse their buffers for outputs of
+  the same shape and type instead of allocating new device memory.
+  Donated buffers must not be read afterwards. Not supported
+  with sharded execution. See `Nx.donatable/1`.
+
   """
-  def jit(function, args, options \\ []) do
-    Nx.Defn.jit(function, args, Keyword.put(options, :compiler, EXLA))
+  def jit(function, options \\ []) do
+    Nx.Defn.jit(function, Keyword.put(options, :compiler, EXLA))
+  end
+
+  @doc """
+  A shortcut for `Nx.Defn.jit_apply/3` with the EXLA compiler.
+
+      iex> EXLA.jit_apply(&Nx.add(&1, &1), [Nx.tensor([1, 2, 3])])
+      #Nx.Tensor<
+        s32[3]
+        [2, 4, 6]
+      >
+
+  See `jit/2` for supported options.
+  """
+  def jit_apply(function, args, options \\ []) do
+    Nx.Defn.jit_apply(function, args, Keyword.put(options, :compiler, EXLA))
+  end
+
+  @doc """
+  A shortcut for `Nx.Defn.compile/3` with the EXLA compiler.
+
+      iex> fun = EXLA.compile(&Nx.add(&1, &1), [Nx.template({3}, {:s, 32})])
+      iex> fun.(Nx.tensor([1, 2, 3]))
+      #Nx.Tensor<
+        s32[3]
+        [2, 4, 6]
+      >
+
+  The returned function can be sent across nodes, as long as the parent
+  node (which effectively holds the function) keeps a reference to the
+  function while it is invoked by any other node it was sent to. On
+  invocation, the underlying executable is automatically serialized
+  and sent to other nodes, without requiring a full recompilation.
+
+  See `jit/2` for supported options.
+  """
+  def compile(function, args, options \\ []) do
+    Nx.Defn.compile(function, args, Keyword.put(options, :compiler, EXLA))
+  end
+
+  @doc """
+  A shortcut for `Nx.Defn.shard_jit/3` with the EXLA compiler.
+
+  ## Example
+
+      mesh = %Nx.Mesh{name: "mesh", shape: {2}}
+      fun = EXLA.shard_jit(&Nx.add(&1, &1), mesh, input_shardings: [%{0 => [0]}])
+      # Pass sharded inputs (one arglist per partition)
+      fun.([[Nx.tensor([1, 2, 3])], [Nx.tensor([4, 5, 6])]])
+      #=> #Nx.Tensor<
+      #     s32[6]
+      #     [2, 4, 6, 8, 10, 12]
+      #   >
+
+  ## Options
+
+    * `:input_shardings` - a list of maps specifying how to shard each input tensor.
+      Each map has tensor dimension (integer index or atom name) as keys and lists of
+      mesh axis indices as values. Dimensions not specified are replicated.
+
+      Examples:
+        - `[%{0 => [0], 1 => [1]}]` - shard first input's dim 0 on mesh axis 0, dim 1 on mesh axis 1
+        - `[%{0 => [0]}, %{1 => [1]}]` - first input sharded on dim 0, second input sharded on dim 1
+        - `[%{0 => [0, 1]}]` - shard dim 0 across both mesh axes 0 and 1
+        - `[%{}]` - fully replicated tensor
+
+  Also accepts the same options as `compile/3`.
+  """
+  def shard_jit(function, %Nx.Mesh{} = mesh, options \\ []) when is_list(options) do
+    Nx.Defn.shard_jit(function, mesh, Keyword.put(options, :compiler, EXLA))
+  end
+
+  @doc ~S'''
+  Takes in a function, the argument templates and the compilation
+  options and returns the textual representation of the MLIR module.
+
+  ## Options
+
+    * `:within_defn_compiler` - a boolean that indicates whether
+      this function is being called from within a `defn` compiler.
+      Defaults to `false`.
+
+  ## Examples
+
+      iex> fun = fn x, y -> Nx.add(Nx.sin(x), Nx.cos(y)) end
+      iex> args = [1.0, 2.0]
+      iex> %{mlir_module: mlir_module} = EXLA.to_mlir_module(fun, args)
+      iex> mlir_module =~ "func.func public @main"
+      true
+      iex> mlir_module =~ "stablehlo.add"
+      true
+  '''
+  def to_mlir_module(function, args, options \\ []) do
+    {nested_compilation?, options} = Keyword.pop(options, :within_defn_compiler, false)
+    mesh = Keyword.get(options, :mesh)
+
+    opts =
+      Keyword.merge(options,
+        module_compilation: :to_mlir,
+        compiler: EXLA
+      )
+
+    if nested_compilation? do
+      if mesh do
+        EXLA.Defn.__shard_jit__(function, mesh, args, function, args, opts)
+      else
+        EXLA.Defn.__compile__(function, args, function, opts)
+      end
+    else
+      if mesh do
+        # shard_jit returns a function that expects args as separate parameters
+        Nx.Defn.shard_jit(function, mesh, opts).(args)
+      else
+        Nx.Defn.compile(function, args, opts)
+      end
+    end
+  catch
+    {:mlir_module, ref, used_inputs, output_container} ->
+      %{
+        used_inputs: used_inputs,
+        output_container: output_container,
+        mlir_module: EXLA.MLIR.Module.as_string(%EXLA.MLIR.Module{ref: ref})
+      }
+  end
+
+  @doc """
+  Compiles `function` for `args` and returns the `EXLA.Executable` instead of
+  a callable, so the compiled program can be inspected with
+  `EXLA.Executable.memory_stats/1` and `EXLA.Executable.optimized_hlo/1`.
+  """
+  def to_executable(function, args, options \\ []) do
+    opts = Keyword.merge(options, module_compilation: :to_executable, compiler: EXLA)
+    Nx.Defn.compile(function, args, opts)
+  catch
+    {:executable, executable} -> executable
+  end
+
+  @doc """
+  Checks if the compilation of function with args is cached.
+
+  Note that the `:hooks` option is part of the cache, and
+  therefore it must be included in the options.
+
+  ## Examples
+
+      iex> fun = fn a, b -> Nx.add(a, b) end
+      iex> left = Nx.tensor(1, type: {:u, 8})
+      iex> right = Nx.tensor([1, 2, 3], type: {:u, 16})
+      iex> EXLA.jit(fun).(left, right)
+      iex> EXLA.cached?(fun, [left, right])
+      true
+      iex> EXLA.cached?(fun, [left, Nx.tensor([1, 2, 3, 4], type: {:u, 16})])
+      false
+
+  Compiled functions are also cached, unless cache is set to false:
+
+      iex> fun = fn a, b -> Nx.subtract(a, b) end
+      iex> left = Nx.tensor(1, type: {:u, 8})
+      iex> right = Nx.tensor([1, 2, 3], type: {:u, 16})
+      iex> EXLA.compile(fun, [left, right], cache: false)
+      iex> EXLA.cached?(fun, [left, right])
+      false
+      iex> EXLA.compile(fun, [left, right])
+      iex> EXLA.cached?(fun, [left, right])
+      true
+
+  """
+  def cached?(function, args, options \\ []) do
+    function |> jit([{EXLA, cached_check()} | options]) |> apply(args)
+  catch
+    {:cached?, bool} -> bool
+  end
+
+  defp cached_check do
+    expr_cache_fun = fn key, _callback ->
+      if res = EXLA.Defn.LockedCache.get(key) do
+        {nil, res}
+      else
+        throw({:cached?, false})
+      end
+    end
+
+    comp_cache_fun = fn key, _callback ->
+      throw({:cached?, EXLA.Defn.LockedCache.get(key) != nil})
+    end
+
+    {expr_cache_fun, comp_cache_fun}
+  end
+
+  @doc """
+  Loads a native shared library into the OS process running the VM.
+
+  ## Path
+
+  `path` is a string handed to the system dynamic loader as is, extension
+  included (`.so`, also `.dylib` on macOS). Look up rules are the same as
+  for native dynamic linking loaders (for example, searching through
+  `LD_LIBRARY_PATH`). Therefore, using absolute paths is advised.
+
+  ## Loading semantics
+
+  The library must be loaded **before** EXLA compiles a computation emitting one
+  of the targets it implements. Otherwise compilation fails with an unregistered
+  custom call error. Your application `start/2` callback is a good place for it:
+
+      defmodule MyApp.Application do
+        use Application
+
+        @impl true
+        def start(_type, _args) do
+          :ok = EXLA.load_dylib(Application.app_dir(:my_app, "priv/libmy_custom_calls.so"))
+          Supervisor.start_link([], strategy: :one_for_one, name: MyApp.Supervisor)
+        end
+      end
+
+  The library is never unloaded, since XLA holds on to the registered handlers
+  for as long as the VM runs. Therefore, it is advised that the library is as
+  lightweight as possible.
+
+  ## Errors
+
+  An `ArgumentError` is raised with the message reported by the dynamic loader
+  when the library cannot be opened. The usual causes are a path that does not
+  exist, a library built for a different architecture, and symbols that cannot
+  be resolved.
+
+  This function is only supported on Unix systems (Linux and macOS).
+  """
+  @spec load_dylib(Path.t()) :: :ok
+  def load_dylib(path) when is_binary(path) do
+    EXLA.NIF.load_dylib(path)
   end
 
   @impl true
-  defdelegate __jit__(key, vars, fun, opts), to: EXLA.Defn
+  defdelegate __compile__(key, vars, fun, opts), to: EXLA.Defn
 
   @impl true
-  def __stream__(_, _, _, _, _, _), do: raise("not implemented")
+  defdelegate __jit__(key, vars, fun, args, opts), to: EXLA.Defn
+
+  @impl true
+  defdelegate __partitions_options__(opts), to: EXLA.Defn
+
+  @impl true
+  defdelegate __to_backend__(opts), to: EXLA.Defn
+
+  @impl true
+  defdelegate __shard_jit__(key, mesh, list_of_vars, fun, args_list, opts), to: EXLA.Defn
 end
